@@ -1,0 +1,17 @@
+{
+  "fps_target": null,
+  "exposure_us": 10000.0,
+  "gamma": 1.0,
+  "auto_gamma": false,
+  "roi_x": 0,
+  "roi_y": 0,
+  "roi_width": 4096,
+  "roi_height": 2304,
+  "binning": 1,
+  "frame_bundle": 1,
+  "save_path": "C:/data",
+  "num_frames": 1000,
+  "ram_buffer_frames": 500,
+  "trigger_delay": 0.0,
+  "readout_speed": 1
+}
