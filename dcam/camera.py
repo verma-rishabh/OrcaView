@@ -25,19 +25,26 @@ from .dcam_types import (
     DCAM_IDPROP_SUBARRAYVPOS, DCAM_IDPROP_SUBARRAYHSIZE,
     DCAM_IDPROP_SUBARRAYVSIZE, DCAM_IDPROP_BINNING,
     DCAM_IDPROP_FRAMEBUNDLE_MODE, DCAM_IDPROP_FRAMEBUNDLE_NUMBER,
+    DCAM_IDPROP_FRAMEBUNDLE_FRAMESTEPBYTES,
     DCAM_IDPROP_TRIGGERSOURCE, DCAM_IDPROP_TRIGGER_MODE,
     DCAM_IDPROP_TRIGGER_DELAY, DCAM_IDPROP_READOUTSPEED,
+    DCAM_IDPROP_IMAGE_WIDTH, DCAM_IDPROP_IMAGE_HEIGHT,
     DCAM_IDSTR_MODEL, DCAM_IDSTR_SERIALNUMBER,
     # Property values
-    DCAMPROP_TRIGGERSOURCE__INTERNAL, DCAMPROP_TRIGGER_MODE__NORMAL,
+    DCAMPROP_TRIGGERSOURCE__INTERNAL, DCAMPROP_TRIGGERSOURCE__EXTERNAL,
+    DCAMPROP_TRIGGER_MODE__NORMAL, DCAMPROP_TRIGGER_MODE__START,
     DCAMPROP_MODE__OFF, DCAMPROP_MODE__ON,
     DCAMPROP_SUBARRAY_MODE__OFF, DCAMPROP_SUBARRAY_MODE__ON,
+    DCAMPROP_READOUTSPEED__FASTEST,
     # Capture
     DCAMCAP_START_SEQUENCE, DCAMWAIT_CAPEVENT_FRAMEREADY,
     DCAMERR_SUCCESS,
 )
 
 _BINNING_MAP = {1: 1.0, 2: 2.0, 4: 4.0}
+
+# Set to True to print a readback comparison after every apply_settings() call.
+DEBUG_SETTINGS = False
 
 
 @dataclass
@@ -68,11 +75,57 @@ class DCAMCamera:
         cam.close()
     """
 
+    @staticmethod
+    def enumerate_cameras() -> list[tuple[int, str, str]]:
+        """
+        Return [(index, model, serial), ...] for every camera DCAM can see.
+        Initialises and uninitialises the API internally; safe to call before
+        any DCAMCamera is opened.
+        """
+        import sys
+        if sys.platform != "win32":
+            return []
+        try:
+            api = DCAMAPI()
+        except RuntimeError:
+            return []
+
+        init = DCAMAPI_INIT(size=ctypes.sizeof(DCAMAPI_INIT))
+        if api.dcamapi_init(ctypes.byref(init)) != DCAMERR_SUCCESS:
+            return []
+
+        results: list[tuple[int, str, str]] = []
+        for idx in range(init.iDeviceCount):
+            dev_open = DCAMDEV_OPEN(size=ctypes.sizeof(DCAMDEV_OPEN), index=idx)
+            if api.dcamdev_open(ctypes.byref(dev_open)) != DCAMERR_SUCCESS:
+                continue
+            hdcam = dev_open.hdcam
+
+            def _getstr(string_id: int) -> str:
+                buf = ctypes.create_string_buffer(256)
+                ds = DCAMDEV_STRING(
+                    size=ctypes.sizeof(DCAMDEV_STRING),
+                    iString=string_id,
+                    text=ctypes.cast(buf, ctypes.c_char_p),
+                    textbytes=256,
+                )
+                api.dcamdev_getstring(hdcam, ctypes.byref(ds))
+                return buf.value.decode("ascii", errors="replace")
+
+            model  = _getstr(DCAM_IDSTR_MODEL)
+            serial = _getstr(DCAM_IDSTR_SERIALNUMBER)
+            results.append((idx, model, serial))
+            api.dcamdev_close(hdcam)
+
+        api.dcamapi_uninit()
+        return results
+
     def __init__(self, device_index: int = 0):
         self._index  = device_index
         self._api:   DCAMAPI | None         = None
         self._hdcam: ctypes.c_void_p | None = None
         self._hwait: ctypes.c_void_p | None = None
+        self._framestepbytes: int = 0   # cached after apply_settings; 0 means bundle OFF
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -147,55 +200,90 @@ class DCAMCamera:
         """
         Push all CameraSettings to the camera.
         Must be called while capture is stopped.
-        Order matters — see plan notes.
+        Raises RuntimeError if any critical property fails.
         """
-        # 1. Disable subarray so dimension changes are accepted
-        self._set(DCAM_IDPROP_SUBARRAY_MODE, DCAMPROP_SUBARRAY_MODE__OFF)
+        # 1. Disable frame bundle before changing geometry (not supported on all cameras)
+        self._try_set(DCAM_IDPROP_FRAMEBUNDLE_MODE, DCAMPROP_MODE__OFF)
 
-        # 2. Binning (changes effective sensor dimensions)
+        # 2. Disable subarray so dimension changes are accepted, then zero out
+        # the stored offsets before touching sizes.  The camera bounds-checks
+        # every property write as (current_offset + new_value <= sensor_size)
+        # even while subarray mode is OFF, so a non-zero offset left over from
+        # a previous ROI would cause "out-of-range" when we later try to
+        # widen HSIZE or VSIZE beyond (sensor_size - old_offset).
+        self._set(DCAM_IDPROP_SUBARRAY_MODE, DCAMPROP_SUBARRAY_MODE__OFF)
+        self._try_set(DCAM_IDPROP_SUBARRAYHPOS, 0.0)
+        self._try_set(DCAM_IDPROP_SUBARRAYVPOS, 0.0)
+
+        # 3. Readout speed — always fastest for high-speed acquisition
+        self._try_set(DCAM_IDPROP_READOUTSPEED, DCAMPROP_READOUTSPEED__FASTEST)
+
+        # 4. Binning (changes effective sensor dimensions)
         self._set(DCAM_IDPROP_BINNING, _BINNING_MAP[settings.binning])
 
-        # 3. ROI (in binned-pixel coordinates)
-        full_h = 2304 // settings.binning
-        full_w = 4096 // settings.binning
+        # 5. ROI (in sensor pixel coordinates — independent of binning)
+        # Binning reduces output resolution but does not change the ROI coordinate space.
         is_full = (
             settings.roi_x == 0 and settings.roi_y == 0
-            and settings.roi_width  == full_w
-            and settings.roi_height == full_h
+            and settings.roi_width  == 4096
+            and settings.roi_height == 2304
         )
         if not is_full:
-            self._set(DCAM_IDPROP_SUBARRAYHPOS,  float(settings.roi_x))
-            self._set(DCAM_IDPROP_SUBARRAYVPOS,  float(settings.roi_y))
+            # Size must be set BEFORE offset: while subarray mode is OFF the
+            # camera still bounds-checks each write against (current_offset +
+            # new_value <= sensor_size), so writing the offset first against
+            # the old (potentially full-sensor) size causes an out-of-range error.
             self._set(DCAM_IDPROP_SUBARRAYHSIZE, float(settings.roi_width))
             self._set(DCAM_IDPROP_SUBARRAYVSIZE, float(settings.roi_height))
+            self._set(DCAM_IDPROP_SUBARRAYHPOS,  float(settings.roi_x))
+            self._set(DCAM_IDPROP_SUBARRAYVPOS,  float(settings.roi_y))
             self._set(DCAM_IDPROP_SUBARRAY_MODE, DCAMPROP_SUBARRAY_MODE__ON)
-        # else: leave subarray mode OFF (already set above)
+        # else: subarray mode stays OFF; camera uses full binned sensor dimensions.
 
-        # 4. Exposure (seconds)
+        # 6. Frame bundle (after geometry is locked; silently ignored if not supported)
+        if settings.frame_bundle > 1:
+            self._try_set(DCAM_IDPROP_FRAMEBUNDLE_MODE,   DCAMPROP_MODE__ON)
+            self._try_set(DCAM_IDPROP_FRAMEBUNDLE_NUMBER, float(settings.frame_bundle))
+
+        # 7. Exposure (seconds)
         self._set(DCAM_IDPROP_EXPOSURETIME, settings.exposure_us * 1e-6)
 
-        # 5. Gamma (hardware — only if not auto)
+        # 8. Gamma (optional — not supported in all modes)
         if not settings.auto_gamma:
-            self._set(DCAM_IDPROP_GAMMA, settings.gamma)
+            self._try_set(DCAM_IDPROP_GAMMA, settings.gamma)
 
-        # 6. Frame bundle
-        if settings.frame_bundle > 1:
-            self._set(DCAM_IDPROP_FRAMEBUNDLE_MODE,   DCAMPROP_MODE__ON)
-            self._set(DCAM_IDPROP_FRAMEBUNDLE_NUMBER, float(settings.frame_bundle))
-        else:
-            self._set(DCAM_IDPROP_FRAMEBUNDLE_MODE, DCAMPROP_MODE__OFF)
+        # 9. Trigger source and mode
+        self._set(DCAM_IDPROP_TRIGGERSOURCE, float(settings.trigger_source))
+        self._set(DCAM_IDPROP_TRIGGER_MODE,  float(settings.trigger_mode))
 
-        # 7. Trigger: internal free-run
-        self._set(DCAM_IDPROP_TRIGGERSOURCE, DCAMPROP_TRIGGERSOURCE__INTERNAL)
-        self._set(DCAM_IDPROP_TRIGGER_MODE,  DCAMPROP_TRIGGER_MODE__NORMAL)
-
-        # 8. Trigger delay (seconds)
+        # 10. Trigger delay (optional)
         if settings.trigger_delay > 0:
-            self._set(DCAM_IDPROP_TRIGGER_DELAY, settings.trigger_delay)
+            self._try_set(DCAM_IDPROP_TRIGGER_DELAY, settings.trigger_delay)
+
+        # 11. Cache framestepbytes so lock_frame_into doesn't query per-frame.
+        #     Only meaningful when bundle mode is ON; zero otherwise.
+        if settings.frame_bundle > 1:
+            self._framestepbytes = int(self._get(DCAM_IDPROP_FRAMEBUNDLE_FRAMESTEPBYTES))
+        else:
+            self._framestepbytes = 0
+
+        if DEBUG_SETTINGS:
+            self._debug_readback(settings)
 
     # ------------------------------------------------------------------
     # Property helpers
     # ------------------------------------------------------------------
+
+    def get_image_shape(self) -> tuple[int, int]:
+        """
+        Returns (height, width) of one DMA frame after apply_settings().
+        Reads IMAGE_HEIGHT / IMAGE_WIDTH directly from the camera — these are
+        SDK read-only properties that reflect the actual DMA frame dimensions
+        including any frame bundling, binning, and ROI the camera accepted.
+        """
+        h = int(self._get(DCAM_IDPROP_IMAGE_HEIGHT))
+        w = int(self._get(DCAM_IDPROP_IMAGE_WIDTH))
+        return (h, w)
 
     def get_readout_time(self) -> float:
         """Returns DCAM_IDPROP_TIMING_READOUTTIME in seconds (post-ROI/binning)."""
@@ -204,6 +292,21 @@ class DCAMCamera:
     def get_actual_fps(self) -> float:
         """Returns the camera's current maximum frame rate (read-only property)."""
         return self._get(DCAM_IDPROP_TIMING_FRAMERATE)
+
+    def get_exposure_us(self) -> float:
+        """Returns the actual exposure time in microseconds as accepted by the camera."""
+        return self._get(DCAM_IDPROP_EXPOSURETIME) * 1e6
+
+    def get_binning(self) -> int:
+        """Returns the active binning factor read back from the camera."""
+        return int(self._get(DCAM_IDPROP_BINNING))
+
+    def get_frame_bundle(self) -> int:
+        """Returns the active frame bundle count (1 if bundle mode is OFF)."""
+        mode = self._get(DCAM_IDPROP_FRAMEBUNDLE_MODE)
+        if int(mode) != int(DCAMPROP_MODE__ON):
+            return 1
+        return int(self._get(DCAM_IDPROP_FRAMEBUNDLE_NUMBER))
 
     def get_prop_range(self, prop_id: int) -> tuple[float, float, float]:
         """Returns (min, max, step) for a property."""
@@ -218,18 +321,34 @@ class DCAMCamera:
         return val.value
 
     def _set(self, prop_id: int, value: float) -> None:
-        err = self._api.dcamprop_setvalue(self._hdcam, prop_id,
-                                          ctypes.c_double(value))
-        if err != DCAMERR_SUCCESS:
-            # Non-fatal for some props (e.g. GAMMA not supported in all modes)
-            pass
+        """Set a property — raises RuntimeError on failure."""
+        self._check(
+            self._api.dcamprop_setvalue(self._hdcam, prop_id, ctypes.c_double(value)),
+            f"dcamprop_setvalue(0x{prop_id:08X}, {value})",
+        )
+
+    def _try_set(self, prop_id: int, value: float) -> None:
+        """Set a property, silently ignoring errors (for optional props)."""
+        self._api.dcamprop_setvalue(self._hdcam, prop_id, ctypes.c_double(value))
 
     # ------------------------------------------------------------------
     # Capture control
     # ------------------------------------------------------------------
 
     def start_capture(self, n_buffer_frames: int = 100) -> None:
-        """Allocate DMA ring buffer and start free-running capture."""
+        """Allocate DMA ring buffer and start free-running capture.
+
+        Defensively stops any in-progress capture and releases any previously
+        allocated buffers first.  Both calls are idempotent per the SDK docs
+        (dcamcap_stop does nothing when already idle; dcambuf_release returns
+        a benign error when no buffer is allocated), so this is safe to call
+        even from a clean STABLE state.  This also recovers from sessions that
+        were terminated without calling stop_capture() — the DCAM driver
+        preserves device state across process boundaries.
+        """
+        # Bring camera to STABLE state before allocating a fresh buffer.
+        self._api.dcamcap_stop(self._hdcam)       # BUSY → READY (no-op if idle)
+        self._api.dcambuf_release(self._hdcam, 0) # READY → STABLE (ignored if no buf)
         self._check(self._api.dcambuf_alloc(self._hdcam, n_buffer_frames),
                     "dcambuf_alloc")
         self._check(self._api.dcamcap_start(self._hdcam, DCAMCAP_START_SEQUENCE),
@@ -237,8 +356,13 @@ class DCAMCamera:
 
     def stop_capture(self) -> None:
         """Stop capture and free DMA buffer."""
-        self._api.dcamcap_stop(self._hdcam)
-        self._api.dcambuf_free(self._hdcam)
+        import sys
+        err = self._api.dcamcap_stop(self._hdcam)
+        if err != DCAMERR_SUCCESS:
+            print(f"[DCAM] dcamcap_stop warning: 0x{err & 0xFFFFFFFF:08X}", file=sys.stderr, flush=True)
+        err = self._api.dcambuf_release(self._hdcam, 0)   # iKind=0 required by SDK
+        if err != DCAMERR_SUCCESS:
+            print(f"[DCAM] dcambuf_release warning: 0x{err & 0xFFFFFFFF:08X}", file=sys.stderr, flush=True)
 
     # ------------------------------------------------------------------
     # Frame retrieval
@@ -266,11 +390,20 @@ class DCAMCamera:
         if self._hwait:
             self._api.dcamwait_abort(self._hwait)
 
-    def copy_frame(self, frame_index: int = -1) -> FrameData:
+    def lock_frame_into(self, out: np.ndarray, frame_index: int = -1) -> tuple[float, int, int]:
         """
-        Lock the frame buffer, copy pixel data into a new numpy array, unlock.
-        frame_index=-1 means the most recently captured frame.
-        The copy happens inside the lock so the DMA slot is released immediately.
+        Lock the DMA frame buffer and copy pixel data directly into `out`.
+
+        `out` must be a pre-allocated uint16 array of shape (H, W) where:
+          - Without bundling: H = IMAGE_HEIGHT, W = IMAGE_WIDTH
+          - With bundle N:    H = IMAGE_HEIGHT * N, W = IMAGE_WIDTH
+            (sub-frames are stacked vertically; each sub-frame is IMAGE_HEIGHT rows)
+
+        When bundle > 1 the SDK places sub-frames at intervals of
+        FRAMEBUNDLE_FRAMESTEPBYTES bytes (may include padding rows).
+        We walk those offsets explicitly rather than assuming contiguous layout.
+
+        Returns (timestamp_sec, framestamp, camerastamp).
         """
         frame = DCAMBUF_FRAME(
             size   = ctypes.sizeof(DCAMBUF_FRAME),
@@ -279,33 +412,116 @@ class DCAMCamera:
         self._check(self._api.dcambuf_lockframe(self._hdcam, ctypes.byref(frame)),
                     "dcambuf_lockframe")
 
-        # Build numpy view into DMA memory, then copy out immediately
-        n_pixels = frame.width * frame.height
-        raw = (ctypes.c_uint16 * n_pixels).from_address(frame.buf)
-        pixels = np.ctypeslib.as_array(raw).reshape(frame.height, frame.width).copy()
+        sub_h = frame.height   # height of ONE sub-frame (IMAGE_HEIGHT)
+        sub_w = frame.width
 
-        ts = frame.timestamp.to_seconds()
-        fs = frame.framestamp
-        cs = frame.camerastamp
-        w, h = frame.width, frame.height
+        if out.shape[1] != sub_w or out.shape[0] % sub_h != 0:
+            raise RuntimeError(
+                f"Frame shape mismatch: ring buffer slot={out.shape}, "
+                f"camera sub-frame=({sub_h}, {sub_w}). "
+                f"This usually means ROI or frame-bundle settings changed "
+                f"without re-allocating the ring buffer."
+            )
 
-        # Release DMA slot before returning (must be done after copy)
-        # DCAM-SDK4 does not have an explicit unlock call for lockframe;
-        # the slot is recycled automatically when start_capture's ring buffer
-        # wraps. copyframe is the alternative that copies internally.
-        return FrameData(pixels=pixels, frame_index=fs,
-                         timestamp=ts, camera_stamp=cs,
-                         width=w, height=h)
+        n_bundle = out.shape[0] // sub_h
+        n_pixels = sub_h * sub_w
+
+        if n_bundle == 1:
+            raw = (ctypes.c_uint16 * n_pixels).from_address(frame.buf)
+            np.copyto(out, np.ctypeslib.as_array(raw).reshape(sub_h, sub_w))
+        else:
+            # Each sub-frame starts at buf + i * framestepbytes.
+            # framestepbytes >= rowbytes * sub_h (may include dummy padding rows).
+            # Cached in apply_settings() to avoid per-frame property reads.
+            framestepbytes = self._framestepbytes
+            for i in range(n_bundle):
+                src = frame.buf + i * framestepbytes
+                raw = (ctypes.c_uint16 * n_pixels).from_address(src)
+                out[i * sub_h : (i + 1) * sub_h] = (
+                    np.ctypeslib.as_array(raw).reshape(sub_h, sub_w)
+                )
+
+        return frame.timestamp.to_seconds(), frame.framestamp, frame.camerastamp
 
     def get_transfer_info(self) -> tuple[int, int]:
-        """Returns (total_frames_captured, lost_frames) from DCAM."""
+        """Returns (total_frames_captured, newest_frame_index) from DCAM.
+        Note: DCAM SDK does not expose a lost-frame counter via transferinfo;
+        nFrameCount is the total captured, nNewestFrameIndex is the latest index."""
         ti = DCAMCAP_TRANSFERINFO(size=ctypes.sizeof(DCAMCAP_TRANSFERINFO))
         self._api.dcamcap_transferinfo(self._hdcam, ctypes.byref(ti))
-        return ti.nFrameCount, ti.nLostCount
+        return ti.nFrameCount, ti.nNewestFrameIndex
 
     # ------------------------------------------------------------------
     # Internal
     # ------------------------------------------------------------------
+
+    def _debug_readback(self, settings) -> None:
+        """Read back every property from the camera and compare to requested values."""
+        cam_exposure_us = self._get(DCAM_IDPROP_EXPOSURETIME) * 1e6
+        cam_binning     = int(self._get(DCAM_IDPROP_BINNING))
+        cam_hpos        = int(self._get(DCAM_IDPROP_SUBARRAYHPOS))
+        cam_hsize       = int(self._get(DCAM_IDPROP_SUBARRAYHSIZE))
+        cam_vpos        = int(self._get(DCAM_IDPROP_SUBARRAYVPOS))
+        cam_vsize       = int(self._get(DCAM_IDPROP_SUBARRAYVSIZE))
+        cam_subarray    = int(self._get(DCAM_IDPROP_SUBARRAY_MODE))
+        cam_bundle_mode = int(self._get(DCAM_IDPROP_FRAMEBUNDLE_MODE))
+        cam_bundle_num  = int(self._get(DCAM_IDPROP_FRAMEBUNDLE_NUMBER))
+        _cam_readout    = self._get(DCAM_IDPROP_READOUTSPEED)
+        cam_trig_src    = int(self._get(DCAM_IDPROP_TRIGGERSOURCE))
+        cam_trig_mode   = int(self._get(DCAM_IDPROP_TRIGGER_MODE))
+        cam_image_h, cam_image_w = self.get_image_shape()
+
+        # SUBARRAYHSIZE/VSIZE registers are only meaningful when subarray is ON.
+        # When subarray is OFF the camera uses full sensor dimensions regardless
+        # of what those registers hold (they may be stale from a prior ROI).
+        sub_on = (cam_subarray == 2)
+        # IMAGE_WIDTH/HEIGHT are output (post-binning) pixels.
+        # Frame bundle stacks N roi_height rows into one DMA transfer.
+        expected_image_w = settings.roi_width  // settings.binning
+        expected_image_h = (settings.roi_height // settings.binning) * max(1, settings.frame_bundle)
+
+        rows = [
+            ("exposure_us",   f"{settings.exposure_us:.1f}",  f"{cam_exposure_us:.1f}",
+             abs(cam_exposure_us - settings.exposure_us) > 1.0),
+            ("binning",       settings.binning,                cam_binning,
+             cam_binning != settings.binning),
+            # Register checks only meaningful when subarray is ON
+            ("roi_x (hpos)",  settings.roi_x,                 cam_hpos,
+             sub_on and cam_hpos != settings.roi_x),
+            ("roi_y (vpos)",  settings.roi_y,                 cam_vpos,
+             sub_on and cam_vpos != settings.roi_y),
+            ("roi_w (hsize)", settings.roi_width,              cam_hsize,
+             sub_on and cam_hsize != settings.roi_width),
+            ("roi_h (vsize)", settings.roi_height,             cam_vsize,
+             sub_on and cam_vsize != settings.roi_height),
+            ("subarray_mode", "ON" if settings.roi_width != 4096//settings.binning
+                              or settings.roi_height != 2304//settings.binning
+                              else "OFF",
+             "ON" if sub_on else "OFF",
+             False),
+            ("bundle_mode",   "ON" if settings.frame_bundle > 1 else "OFF",
+             "ON" if cam_bundle_mode == 2 else "OFF",
+             (settings.frame_bundle > 1) != (cam_bundle_mode == 2)),
+            ("bundle_number", settings.frame_bundle,           cam_bundle_num,
+             settings.frame_bundle > 1 and cam_bundle_num != settings.frame_bundle),
+            ("trig_source",   1,                               cam_trig_src,
+             cam_trig_src != 1),
+            ("trig_mode",     1,                               cam_trig_mode,
+             cam_trig_mode != 1),
+            # IMAGE_WIDTH/HEIGHT are output (post-binning) pixels — ground truth
+            ("image_w",       expected_image_w,                cam_image_w,
+             cam_image_w != expected_image_w),
+            ("image_h",       expected_image_h,                cam_image_h,
+             cam_image_h != expected_image_h),
+        ]
+
+        print("\n[DEBUG apply_settings readback]")
+        print(f"  {'property':<18} {'requested':<20} {'camera':<20} {'MISMATCH'}")
+        print(f"  {'-'*70}")
+        for name, req, got, mismatch in rows:
+            flag = "  <<<" if mismatch else ""
+            print(f"  {name:<18} {str(req):<20} {str(got):<20}{flag}")
+        print()
 
     def _check(self, err: int, context: str = "") -> None:
         if err != DCAMERR_SUCCESS:

@@ -52,14 +52,11 @@ class CameraSettings:
 
     # --- Recording ---
     save_path:     str = "C:/data"
-    num_frames:    int = 1000
-    ram_buffer_frames: int = 2000   # ring buffer size (frames in RAM)
 
     # --- Trigger ---
-    trigger_delay: float = 0.0   # seconds
-
-    # --- Readout ---
-    readout_speed: int = 1   # 1 = fastest available
+    trigger_source: int   = 1     # 1=Internal, 2=External
+    trigger_mode:   int   = 1     # 1=Normal (frame), 6=Start (sequence)
+    trigger_delay:  float = 0.0   # seconds
 
     # ------------------------------------------------------------------
 
@@ -74,11 +71,12 @@ class CameraSettings:
         self.roi_y      = _align(self.roi_y, 2)
         self.roi_height = max(2, _align(self.roi_height, 2))
 
-        # Clamp within sensor bounds (accounting for binning)
-        max_w = 4096 // self.binning
-        max_h = 2304 // self.binning
-        self.roi_width  = min(self.roi_width,  max_w - self.roi_x)
-        self.roi_height = min(self.roi_height, max_h - self.roi_y)
+        # Clamp within sensor bounds. ROI is always in sensor pixel coordinates;
+        # binning is independent and reduces output resolution, not ROI space.
+        self.roi_x      = min(self.roi_x,      4096 - 4)
+        self.roi_y      = min(self.roi_y,      2304 - 2)
+        self.roi_width  = min(self.roi_width,  4096 - self.roi_x)
+        self.roi_height = min(self.roi_height, 2304 - self.roi_y)
 
     def resolve_exposure(self, readout_time_sec: float) -> None:
         """

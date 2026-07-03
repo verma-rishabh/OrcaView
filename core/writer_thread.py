@@ -1,28 +1,30 @@
 """
-WriterThread — drains the ring buffer and writes frames to disk.
+WriterThread — drains the ring buffer and writes frames to disk as BigTIFF.
 
-Output format: raw binary (lossless, zero encoding overhead)
-  <stem>.raw          — uint16 pixels, shape (N, H, W), C-order
-  <stem>.timestamps   — float64 array (N,), wall-clock seconds per frame
-  <stem>.framestamps  — int32   array (N,), hardware monotonic counter
-  <stem>.meta.json    — JSON: shape, dtype, roi, fps, binning, date
+Output format: BigTIFF (lossless, uncompressed, >4 GB capable)
+  <stem>.tif   — uint16 multi-page TIFF, one page per sub-frame
+                 Page 0 ImageDescription: JSON with full session metadata + per-frame data
+                 All other pages ImageDescription: JSON with per-frame timestamp/frame_index
 
-At 1000 fps with 4096×256 frames (2 MB/frame), the write rate is ~2 GB/s.
-This requires an NVMe SSD. The ring buffer absorbs bursts if the drive
-temporarily falls behind.
+Stop modes:
+  request_stop()       — immediate abort; frames still in ring buffer are discarded
+  request_drain_stop() — finish writing everything currently in the ring buffer, then stop
+                         Call this when the user clicks Stop, AFTER stopping the acquisition
+                         thread, so no new frames will enter the buffer.
 
 Signals:
-    progress_updated — (frames_written, target)
-    write_complete   — output stem path
+    write_complete   — (stem, frames_written, duration_sec)
     error_occurred   — error string
 """
 from __future__ import annotations
 import json
 import os
 import threading
+import time
 from datetime import datetime
 
 import numpy as np
+import tifffile
 from PyQt6.QtCore import QThread, pyqtSignal
 
 from core.ring_buffer import RingBuffer
@@ -30,89 +32,143 @@ from core.settings import CameraSettings
 
 
 class WriterThread(QThread):
-    progress_updated = pyqtSignal(int, int)   # (written, target)
-    write_complete   = pyqtSignal(str)         # output stem
+    write_complete   = pyqtSignal(str, int, float) # (stem, frames_written, duration_sec)
     error_occurred   = pyqtSignal(str)
 
     def __init__(self, ring_buffer: RingBuffer, settings: CameraSettings,
-                 parent=None):
+                 num_frames: int, actual: dict | None = None, parent=None):
         super().__init__(parent)
-        self._buffer   = ring_buffer
-        self._settings = settings
-        self._stop_flag = threading.Event()
+        self._buffer     = ring_buffer
+        self._settings   = settings
+        self._num_frames = num_frames
+        self._actual     = actual or {}
+        self._stop_flag  = threading.Event()  # immediate abort
+        self._drain_flag = threading.Event()  # drain buffer then stop
+
+    # Max DMA frames to process per batch.
+    _MAX_BATCH = 128
 
     def run(self) -> None:
         s = self._settings
         stem = self._make_stem(s.save_path)
-        target = s.num_frames
-
-        raw_path  = stem + ".raw"
-        ts_path   = stem + ".timestamps"
-        fs_path   = stem + ".framestamps"
-        meta_path = stem + ".meta.json"
+        target = self._num_frames
+        tif_path = stem + ".tif"
 
         try:
             os.makedirs(s.save_path, exist_ok=True)
             written = 0
+            t_start = time.monotonic()
 
-            with open(raw_path, "wb") as f_raw, \
-                 open(ts_path,  "wb") as f_ts,  \
-                 open(fs_path,  "wb") as f_fs:
+            bundle = max(1, s.frame_bundle)
+            sub_h  = s.roi_height // max(1, s.binning)  # height of one sub-frame after binning
 
-                while written < target and not self._stop_flag.is_set():
-                    frames = self._buffer.drain()
-                    if not frames:
-                        self.msleep(2)   # brief yield, not a spin-wait
+            buf = self._buffer
+            cap = buf.capacity
+
+            # Session-level metadata — written once into page 0's ImageDescription.
+            session_meta = {
+                "requested": {
+                    "roi":            {"x": s.roi_x, "y": s.roi_y,
+                                       "width": s.roi_width, "height": s.roi_height},
+                    "fps_target":     s.fps_target,
+                    "exposure_us":    s.exposure_us,
+                    "binning":        s.binning,
+                    "frame_bundle":   s.frame_bundle,
+                    "trigger_source": s.trigger_source,
+                    "trigger_mode":   s.trigger_mode,
+                    "trigger_delay":  s.trigger_delay,
+                },
+                "actual":     self._actual,
+                "date":       datetime.now().isoformat(),
+                "dtype":      "uint16",
+            }
+
+            first_page = True
+
+            with tifffile.TiffWriter(tif_path, bigtiff=True) as tif:
+                while not self._stop_flag.is_set():
+                    drain = self._drain_flag.is_set()
+
+                    rp, wp = buf.begin_drain()
+                    n_available = wp - rp
+
+                    if n_available == 0:
+                        if drain:
+                            break  # buffer empty and drain was requested — we're done
+                        if written >= target:
+                            break  # wrote every requested frame
+                        buf.wait_for_frames(timeout=0.002)
                         continue
 
-                    remaining = target - written
-                    frames = frames[:remaining]
+                    batch = min(n_available, self._MAX_BATCH)
+                    frames_consumed = 0
+                    done = False
 
-                    for fd in frames:
-                        f_raw.write(fd.pixels.tobytes())
-                        f_ts.write(np.float64(fd.timestamp).tobytes())
-                        f_fs.write(np.int32(fd.frame_index).tobytes())
+                    for idx in range(batch):
+                        slot = (rp + idx) % cap
 
-                    written += len(frames)
-                    self.progress_updated.emit(written, target)
+                        # Read metadata once per DMA frame (shared by all sub-frames
+                        # in the bundle — the hardware stamp is per-DMA-transfer).
+                        ts = float(buf.backing_timestamps[slot])
+                        fs = int(buf.backing_frameindices[slot])
 
-            # Write metadata sidecar
-            meta = {
-                "shape":    [written, s.roi_height, s.roi_width],
-                "dtype":    "uint16",
-                "roi":      {"x": s.roi_x, "y": s.roi_y,
-                             "width": s.roi_width, "height": s.roi_height},
-                "fps_target": s.fps_target,
-                "exposure_us": s.exposure_us,
-                "binning":  s.binning,
-                "frame_bundle": s.frame_bundle,
-                "date":     datetime.now().isoformat(),
-                "files": {
-                    "pixels":      os.path.basename(raw_path),
-                    "timestamps":  os.path.basename(ts_path),
-                    "framestamps": os.path.basename(fs_path),
-                },
-                "load_example": (
-                    f"import numpy as np\n"
-                    f"frames = np.fromfile('{os.path.basename(raw_path)}', "
-                    f"dtype=np.uint16).reshape({written}, "
-                    f"{s.roi_height}, {s.roi_width})\n"
-                    f"timestamps = np.fromfile('{os.path.basename(ts_path)}', "
-                    f"dtype=np.float64)"
-                ),
-            }
-            with open(meta_path, "w", encoding="utf-8") as f:
-                json.dump(meta, f, indent=2)
+                        for i in range(bundle):
+                            # In non-drain mode, stop exactly at target.
+                            if not drain and written >= target:
+                                done = True
+                                break
 
-            self.write_complete.emit(stem)
+                            sub = buf.backing_pixels[slot, i * sub_h : (i + 1) * sub_h]
+
+                            per_frame = {
+                                "timestamp":    ts,
+                                "frame_index":  fs,
+                                "frame_number": written,
+                            }
+
+                            if first_page:
+                                desc = json.dumps({**session_meta, **per_frame})
+                                first_page = False
+                            else:
+                                desc = json.dumps(per_frame)
+
+                            tif.write(
+                                sub,
+                                photometric="minisblack",
+                                description=desc,
+                                contiguous=False,
+                            )
+                            written += 1
+
+                        frames_consumed += 1
+                        if done:
+                            break
+
+                    buf.end_drain(frames_consumed)
+
+                    if done:
+                        break
+
+            duration = time.monotonic() - t_start
+            self.write_complete.emit(stem, written, duration)
 
         except Exception as exc:
             self.error_occurred.emit(str(exc))
 
     def request_stop(self) -> None:
+        """Immediate abort — frames still in the ring buffer are discarded."""
         self._stop_flag.set()
+
+    def request_drain_stop(self) -> None:
+        """
+        Drain all frames currently in the ring buffer, then stop.
+        Call this after stopping the acquisition thread so no new frames arrive.
+        The writer will emit write_complete when the drain is finished.
+        """
+        self._drain_flag.set()
 
     @staticmethod
     def _make_stem(save_path: str) -> str:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        os.makedirs(save_path, exist_ok=True)
         return os.path.join(save_path, f"recording_{ts}")

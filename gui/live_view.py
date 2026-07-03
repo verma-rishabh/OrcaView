@@ -13,7 +13,7 @@ thread directly) to decouple display rate from camera rate.
 from __future__ import annotations
 
 import numpy as np
-from PyQt6.QtCore import Qt, QRect
+from PyQt6.QtCore import Qt, QRect, pyqtSignal
 from PyQt6.QtGui import QImage, QPainter, QPixmap, QColor
 from PyQt6.QtWidgets import QWidget
 
@@ -21,11 +21,17 @@ from gui.roi_overlay import ROIOverlay
 
 
 class LiveViewWidget(QWidget):
+    # Emitted after the one-shot contrast capture fires, so the checkbox unchecks.
+    auto_contrast_done = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
-        self._pixmap:  QPixmap | None = None
-        self._overlay: ROIOverlay     = ROIOverlay()
-        self._binning: int            = 1
+        self._pixmap:        QPixmap | None = None
+        self._overlay:       ROIOverlay     = ROIOverlay()
+        self._binning:       int            = 1
+        self._capture_next:  bool           = False
+        self._ac_lo:         float          = 0.0
+        self._ac_hi:         float          = 0.0   # 0 == no stretch applied yet
         self.setMinimumSize(640, 360)
         self.setStyleSheet("background-color: #111111;")
 
@@ -33,14 +39,36 @@ class LiveViewWidget(QWidget):
     # Called by MainWindow's display timer
     # ------------------------------------------------------------------
 
+    def set_auto_contrast(self, enabled: bool) -> None:
+        """Schedule a one-shot contrast capture on the next frame."""
+        self._capture_next = enabled
+
     def update_frame(self, pixels: np.ndarray) -> None:
         """
         pixels : uint16 numpy array, shape (H, W).
-        Converts to uint8 via right-shift-8 (fast, no per-pixel division).
+        Normal mode  : right-shift-8 (fast, no per-pixel division).
+        After Auto   : stretch using lo/hi captured from the trigger frame.
+          Subsamples 1-in-8 pixels for the percentile so it stays fast on
+          large frames, then applies the stretch to every subsequent frame.
         QPixmap.fromImage() makes an internal copy so 'pixels' can be
         discarded after this call returns.
         """
-        arr8 = (pixels >> 8).astype(np.uint8)
+        if self._capture_next:
+            sample = pixels[::8, ::8]
+            lo = float(np.percentile(sample, 0.5))
+            hi = float(np.percentile(sample, 99.5))
+            if hi > lo:
+                self._ac_lo, self._ac_hi = lo, hi
+            self._capture_next = False
+            self.auto_contrast_done.emit()
+
+        if self._ac_hi > self._ac_lo:
+            arr8 = np.clip(
+                (pixels.astype(np.float32) - self._ac_lo) * (255.0 / (self._ac_hi - self._ac_lo)),
+                0, 255,
+            ).astype(np.uint8)
+        else:
+            arr8 = (pixels >> 8).astype(np.uint8)
         h, w = arr8.shape
         # Pass raw buffer to QImage — stride = w (one byte per pixel)
         qimg = QImage(arr8.data, w, h, w, QImage.Format.Format_Grayscale8)

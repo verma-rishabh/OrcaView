@@ -8,8 +8,19 @@ Design:
     The camera must never stall, so we drop display frames rather than block.
   - Display reader: peek_latest() — returns the most recently written frame
     index without removing it. Non-blocking.
-  - Writer reader (WriterThread): drain() — returns all unread frames since
-    the last call, in order. Lossless during recording.
+  - Writer reader (WriterThread): begin_drain/end_drain for zero-copy batch
+    access, or drain_one() for single-frame copies.
+
+Zero-copy write path:
+  WriterThread calls begin_drain() to snapshot read/write positions, then
+  accesses backing arrays directly via the backing_* properties to write
+  frames to disk without copying.  end_drain(n) advances the read pointer.
+  This eliminates ~2 GB/s of memcpy at 1000 fps (4096×256 uint16 frames).
+
+  Safety: the writer must finish reading a slot before the acquisition
+  thread laps the buffer (capacity frames later).  With 2000 slots at
+  1000 fps this gives ~2 seconds of headroom — far more than any
+  realistic disk I/O stall.
 """
 from __future__ import annotations
 import threading
@@ -38,6 +49,7 @@ class RingBuffer:
         self._capacity = capacity
         self._shape    = frame_shape
         self._lock     = threading.Lock()
+        self._frame_event = threading.Event()
 
         h, w = frame_shape
         # Pre-allocate backing store — no per-frame allocation later
@@ -56,23 +68,31 @@ class RingBuffer:
     # Acquisition thread
     # ------------------------------------------------------------------
 
-    def push(self, frame: FrameData) -> None:
+    def begin_push(self) -> np.ndarray:
+        """
+        Return the pixel array for the next write slot so the caller can copy
+        frame data directly into it (zero intermediate allocation).
+        Must be followed by end_push() to commit the metadata and advance the
+        write pointer.  Only one push may be in-flight at a time (single writer).
+        """
         with self._lock:
-            slot = self._write_pos % self._capacity
-            # Copy directly into pre-allocated array (no heap alloc)
-            self._pixels[slot]       = frame.pixels
-            self._timestamps[slot]   = frame.timestamp
-            self._frameindices[slot] = frame.frame_index
-            self._camerastamps[slot] = frame.camera_stamp
+            self._pending_slot = self._write_pos % self._capacity
+            return self._pixels[self._pending_slot]
 
-            self._write_pos  += 1
+    def end_push(self, timestamp: float, frame_index: int, camera_stamp: int) -> None:
+        """Commit the frame written via begin_push()."""
+        with self._lock:
+            slot = self._pending_slot
+            self._timestamps[slot]    = timestamp
+            self._frameindices[slot]  = frame_index
+            self._camerastamps[slot]  = camera_stamp
+            self._write_pos   += 1
             self._total_pushed += 1
             self._filled = min(self._filled + 1, self._capacity)
-
-            # If the read pointer was lapped, advance it (drop oldest)
             if self._write_pos - self._read_pos > self._capacity:
                 self._read_pos = self._write_pos - self._capacity
                 self._total_dropped += 1
+        self._frame_event.set()
 
     # ------------------------------------------------------------------
     # Display thread (lossy — just peek at most recent)
@@ -94,31 +114,48 @@ class RingBuffer:
             )
 
     # ------------------------------------------------------------------
-    # Writer thread (lossless — drain all since last call)
+    # Writer thread — zero-copy batch drain
     # ------------------------------------------------------------------
 
-    def drain(self) -> list[FrameData]:
+    def begin_drain(self) -> tuple[int, int]:
         """
-        Return all frames written since the last drain() call, in order.
-        The caller (WriterThread) owns the returned FrameData objects.
+        Snapshot the current (read_pos, write_pos).  The caller may then
+        access backing arrays directly for slots read_pos..write_pos-1
+        (each mod capacity).  Call end_drain(n) after writing.
+
+        Zero-copy safety: the caller must finish reading slots before the
+        acquisition thread laps the buffer.  With 2000 slots at 1000 fps
+        this gives ~2 s of headroom.
         """
+        self._frame_event.clear()
         with self._lock:
-            n = self._write_pos - self._read_pos
-            if n <= 0:
-                return []
-            frames = []
-            for i in range(self._read_pos, self._write_pos):
-                slot = i % self._capacity
-                frames.append(FrameData(
-                    pixels      = self._pixels[slot].copy(),
-                    frame_index = int(self._frameindices[slot]),
-                    timestamp   = float(self._timestamps[slot]),
-                    camera_stamp= int(self._camerastamps[slot]),
-                    width       = self._shape[1],
-                    height      = self._shape[0],
-                ))
-            self._read_pos = self._write_pos
-            return frames
+            return self._read_pos, self._write_pos
+
+    def end_drain(self, count: int) -> None:
+        """Advance the read pointer after writing `count` frames."""
+        with self._lock:
+            self._read_pos += count
+
+    def wait_for_frames(self, timeout: float = 0.002) -> None:
+        """Block until a frame is pushed or timeout (seconds)."""
+        self._frame_event.wait(timeout)
+
+    @property
+    def backing_pixels(self) -> np.ndarray:
+        """Direct access to pre-allocated pixel array (capacity, H, W)."""
+        return self._pixels
+
+    @property
+    def backing_timestamps(self) -> np.ndarray:
+        return self._timestamps
+
+    @property
+    def backing_frameindices(self) -> np.ndarray:
+        return self._frameindices
+
+    @property
+    def capacity(self) -> int:
+        return self._capacity
 
     def reset_read_pointer(self) -> None:
         """Call before starting a new recording to avoid stale data."""
@@ -159,3 +196,4 @@ class RingBuffer:
             self._total_pushed = 0
             self._total_dropped = 0
             self._filled       = 0
+        self._frame_event.clear()

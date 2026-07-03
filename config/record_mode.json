@@ -9,9 +9,5 @@
   "roi_height": 256,
   "binning": 1,
   "frame_bundle": 4,
-  "save_path": "C:/data",
-  "num_frames": 10000,
-  "ram_buffer_frames": 2000,
-  "trigger_delay": 0.0,
-  "readout_speed": 1
+  "save_path": "C:/test_camera"
 }

@@ -5,21 +5,28 @@ Sections (top → bottom):
   1. Preset buttons (Live Mode / Record Mode)
   2. Exposure & FPS
   3. Image (gamma, ROI, binning, frame bundle)
-  4. Recording (save path, num frames)
-  5. Advanced (readout speed, trigger delay)
-  6. Action buttons (Start/Stop Live | Start/Stop Record)
-  7. Save current settings button
+  4. Recording (save path, trigger source)
+  5. Action buttons (Start/Stop Record)
+  6. Save current settings button
 """
 from __future__ import annotations
 import os
 
-from PyQt6.QtCore import Qt, pyqtSignal
+from PyQt6.QtCore import Qt, QEvent, QObject, pyqtSignal
 from PyQt6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QGroupBox, QPushButton, QLabel, QSpinBox,
     QDoubleSpinBox, QCheckBox, QComboBox, QLineEdit,
-    QSlider, QFileDialog, QScrollArea, QSizePolicy, QProgressBar,
+    QSlider, QFileDialog, QScrollArea,
 )
+
+
+class _NoScroll(QObject):
+    """Event filter that eats wheel events so spinboxes/combos don't change on scroll."""
+    def eventFilter(self, obj: QObject, event: QEvent) -> bool:
+        if event.type() == QEvent.Type.Wheel:
+            return True   # consume — do not forward
+        return False
 
 from core.settings import CameraSettings
 
@@ -30,12 +37,11 @@ class ControlPanel(QWidget):
     load_record_preset = pyqtSignal()
     save_settings      = pyqtSignal()
 
-    start_live    = pyqtSignal()
-    stop_live     = pyqtSignal()
     start_record  = pyqtSignal()
     stop_record   = pyqtSignal()
 
-    settings_changed = pyqtSignal(object)   # CameraSettings
+    settings_changed   = pyqtSignal(object)   # CameraSettings
+    auto_contrast_changed = pyqtSignal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -52,11 +58,12 @@ class ControlPanel(QWidget):
         self._layout.setSpacing(10)
         self._layout.setContentsMargins(10, 10, 10, 10)
 
+        self._last_readout_sec = 0.0   # cached from last camera query
+
         self._build_presets()
         self._build_exposure()
         self._build_image()
         self._build_recording()
-        self._build_advanced()
         self._build_actions()
         self._layout.addStretch()
 
@@ -120,9 +127,12 @@ class ControlPanel(QWidget):
         fps_row.addWidget(self.spin_fps)
         form.addRow("FPS Target:", fps_row)
 
-        self.lbl_readout_info = QLabel("Readout time: —")
-        self.lbl_readout_info.setObjectName("lbl_section")
+        self.lbl_readout_info = QLabel("Readout: — µs | Max: — fps")
         form.addRow("", self.lbl_readout_info)
+
+        self.lbl_camera_info = QLabel("Frame: — | RAM: —")
+        self.lbl_camera_info.setStyleSheet("color: #aaa; font-size: 11px;")
+        form.addRow("", self.lbl_camera_info)
 
         self._layout.addWidget(box)
 
@@ -210,49 +220,14 @@ class ControlPanel(QWidget):
         path_row.addWidget(self.btn_browse)
         form.addRow("Save path:", path_row)
 
-        # Num frames
-        self.spin_num_frames = QSpinBox()
-        self.spin_num_frames.setRange(1, 10_000_000)
-        self.spin_num_frames.setSingleStep(1000)
-        self.spin_num_frames.setToolTip("Number of frames to record")
-        form.addRow("Frames:", self.spin_num_frames)
-
-        # RAM buffer
-        self.spin_ram_buffer = QSpinBox()
-        self.spin_ram_buffer.setRange(100, 50_000)
-        self.spin_ram_buffer.setSingleStep(500)
-        self.spin_ram_buffer.setToolTip(
-            "Ring buffer size in frames (pre-allocated in RAM).\n"
-            "At 4096×256 uint16: 2000 frames ≈ 4 GB")
-        form.addRow("RAM buffer:", self.spin_ram_buffer)
-
-        # Progress bar (shown during recording)
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setRange(0, 100)
-        self.progress_bar.setValue(0)
-        self.progress_bar.setVisible(False)
-        form.addRow("Progress:", self.progress_bar)
-
-        self._layout.addWidget(box)
-
-    def _build_advanced(self):
-        box = QGroupBox("Advanced")
-        form = QFormLayout(box)
-        form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
-        form.setVerticalSpacing(6)
-        form.setHorizontalSpacing(10)
-
-        self.combo_readout = QComboBox()
-        self.combo_readout.addItems(["Fastest", "Standard"])
-        self.combo_readout.setToolTip("Sensor readout speed")
-        form.addRow("Readout:", self.combo_readout)
-
-        self.spin_trig_delay = QDoubleSpinBox()
-        self.spin_trig_delay.setRange(0.0, 10.0)
-        self.spin_trig_delay.setDecimals(4)
-        self.spin_trig_delay.setSuffix(" s")
-        self.spin_trig_delay.setToolTip("Trigger delay (internal trigger, seconds)")
-        form.addRow("Trig delay:", self.spin_trig_delay)
+        # Trigger source for recording
+        self.combo_trig_source = QComboBox()
+        self.combo_trig_source.addItems(["Internal (manual)", "External start trigger"])
+        self.combo_trig_source.setToolTip(
+            "Internal: start/stop via buttons.\n"
+            "External: camera waits for a TTL pulse on the trigger input, then\n"
+            "free-runs until the Stop button is pressed.")
+        form.addRow("Trigger:", self.combo_trig_source)
 
         self._layout.addWidget(box)
 
@@ -260,15 +235,6 @@ class ControlPanel(QWidget):
         box = QGroupBox("Control")
         lay = QVBoxLayout(box)
         lay.setSpacing(6)
-
-        live_row = QHBoxLayout()
-        self.btn_start_live = QPushButton("▶ Start Live")
-        self.btn_stop_live  = QPushButton("■ Stop Live")
-        self.btn_start_live.setObjectName("btn_start_live")
-        self.btn_stop_live.setObjectName("btn_stop_live")
-        self.btn_stop_live.setEnabled(False)
-        live_row.addWidget(self.btn_start_live)
-        live_row.addWidget(self.btn_stop_live)
 
         rec_row = QHBoxLayout()
         self.btn_start_rec = QPushButton("⏺ Record")
@@ -284,7 +250,6 @@ class ControlPanel(QWidget):
         self.btn_save_settings.setToolTip(
             "Save current settings to the last-loaded preset file")
 
-        lay.addLayout(live_row)
         lay.addLayout(rec_row)
         lay.addWidget(self.btn_save_settings)
         self._layout.addWidget(box)
@@ -298,8 +263,6 @@ class ControlPanel(QWidget):
         self.btn_record_preset.clicked.connect(self.load_record_preset)
         self.btn_save_settings.clicked.connect(self.save_settings)
 
-        self.btn_start_live.clicked.connect(self.start_live)
-        self.btn_stop_live.clicked.connect(self.stop_live)
         self.btn_start_rec.clicked.connect(self.start_record)
         self.btn_stop_rec.clicked.connect(self.stop_record)
 
@@ -307,10 +270,39 @@ class ControlPanel(QWidget):
         self.btn_center_roi.clicked.connect(self._center_roi_vertically)
 
         self.chk_fps.toggled.connect(self._on_fps_toggled)
+        self.chk_fps.toggled.connect(self._update_exposure_from_fps)
+        self.chk_fps.toggled.connect(lambda: self.settings_changed.emit(self.collect()))
         self.slider_gamma.valueChanged.connect(
             lambda v: self.lbl_gamma.setText(f"{v / 100:.2f}"))
         self.chk_auto_gamma.toggled.connect(
             lambda on: self.slider_gamma.setEnabled(not on))
+        self.chk_auto_gamma.toggled.connect(self.auto_contrast_changed)
+
+        # Apply settings on Enter (editingFinished) for all camera-affecting spinboxes
+        def _emit():
+            self.settings_changed.emit(self.collect())
+
+        for w in (self.spin_exposure,
+                  self.spin_roi_x, self.spin_roi_y, self.spin_roi_w, self.spin_roi_h,
+                  self.spin_bundle):
+            w.editingFinished.connect(_emit)
+
+        self.spin_fps.editingFinished.connect(self._update_exposure_from_fps)
+        self.spin_fps.editingFinished.connect(_emit)
+
+        # Combo changes apply immediately
+        self.combo_binning.currentIndexChanged.connect(lambda _: _emit())
+        self.combo_trig_source.currentIndexChanged.connect(lambda _: _emit())
+
+        # Disable scroll-wheel value changes on all spinboxes and combo boxes
+        self._no_scroll = _NoScroll(self)
+        for w in (
+            self.spin_exposure, self.spin_fps,
+            self.spin_roi_x, self.spin_roi_y, self.spin_roi_w, self.spin_roi_h,
+            self.spin_bundle,
+            self.combo_binning, self.combo_trig_source,
+        ):
+            w.installEventFilter(self._no_scroll)
 
     def _on_fps_toggled(self, checked: bool) -> None:
         self.spin_fps.setEnabled(checked)
@@ -325,7 +317,7 @@ class ControlPanel(QWidget):
 
     def _center_roi_vertically(self) -> None:
         h = self.spin_roi_h.value()
-        sensor_h = 2304 // max(1, [1, 2, 4][self.combo_binning.currentIndex()])
+        sensor_h = 2304   # ROI is always in sensor pixel coordinates
         y = (sensor_h - h) // 2
         y = (y // 2) * 2   # align to multiple of 2
         self.spin_roi_y.setValue(y)
@@ -336,13 +328,22 @@ class ControlPanel(QWidget):
 
     def populate(self, s: CameraSettings) -> None:
         """Push a CameraSettings object into all controls."""
+        # Block signals that would fire settings_changed or exposure recompute
+        _block = (self.chk_fps, self.combo_binning, self.combo_trig_source)
+        for w in _block:
+            w.blockSignals(True)
+
         self.spin_exposure.setValue(s.exposure_us)
 
         if s.fps_target is not None:
             self.chk_fps.setChecked(True)
             self.spin_fps.setValue(s.fps_target)
+            self.spin_fps.setEnabled(True)
+            self.spin_exposure.setEnabled(False)
         else:
             self.chk_fps.setChecked(False)
+            self.spin_fps.setEnabled(False)
+            self.spin_exposure.setEnabled(True)
 
         self.slider_gamma.setValue(int(s.gamma * 100))
         self.chk_auto_gamma.setChecked(s.auto_gamma)
@@ -357,17 +358,20 @@ class ControlPanel(QWidget):
 
         self.spin_bundle.setValue(s.frame_bundle)
         self.edit_save_path.setText(s.save_path)
-        self.spin_num_frames.setValue(s.num_frames)
-        self.spin_ram_buffer.setValue(s.ram_buffer_frames)
-        self.spin_trig_delay.setValue(s.trigger_delay)
+        # trigger_source: 1=Internal, 2=External → combo index 0/1
+        self.combo_trig_source.setCurrentIndex(0 if s.trigger_source == 1 else 1)
 
-        readout_idx = max(0, min(1, s.readout_speed - 1))
-        self.combo_readout.setCurrentIndex(readout_idx)
+        for w in _block:
+            w.blockSignals(False)
 
     def collect(self) -> CameraSettings:
         """Read all controls and return a CameraSettings object."""
         binning = [1, 2, 4][self.combo_binning.currentIndex()]
         fps_target = self.spin_fps.value() if self.chk_fps.isChecked() else None
+        # combo index 0 → Internal (1), index 1 → External (2)
+        trig_src  = 1 if self.combo_trig_source.currentIndex() == 0 else 2
+        # External trigger uses START mode (one pulse starts free-run sequence)
+        trig_mode = 6 if trig_src == 2 else 1
 
         s = CameraSettings(
             exposure_us      = self.spin_exposure.value(),
@@ -381,47 +385,42 @@ class ControlPanel(QWidget):
             binning          = binning,
             frame_bundle     = self.spin_bundle.value(),
             save_path        = self.edit_save_path.text() or "C:/data",
-            num_frames       = self.spin_num_frames.value(),
-            ram_buffer_frames= self.spin_ram_buffer.value(),
-            trigger_delay    = self.spin_trig_delay.value(),
-            readout_speed    = self.combo_readout.currentIndex() + 1,
+            trigger_source   = trig_src,
+            trigger_mode     = trig_mode,
         )
         s.align_roi()
         return s
 
+    def set_camera_info(self, frame_w: int, sub_h: int, binning: int,
+                        bundle: int, ram_mb: float) -> None:
+        """frame_w/sub_h are the actual camera-reported per-sub-frame dimensions."""
+        self.lbl_camera_info.setText(
+            f"Frame: {frame_w}×{sub_h} px  bin {binning}×{binning}  "
+            f"bundle ×{bundle}  |  RAM: {ram_mb:.0f} MB"
+        )
+
     def set_readout_info(self, readout_us: float, actual_fps: float) -> None:
+        self._last_readout_sec = readout_us / 1e6
         self.lbl_readout_info.setText(
             f"Readout: {readout_us:.0f} µs | Max: {actual_fps:.1f} fps"
         )
+        # Recompute exposure now that we have an accurate readout time
+        self._update_exposure_from_fps()
+
+    def _update_exposure_from_fps(self) -> None:
+        """If FPS mode is active and readout time is known, update the exposure spinbox."""
+        if not self.chk_fps.isChecked() or self._last_readout_sec <= 0:
+            return
+        from core.settings import fps_to_exposure_us
+        exp = fps_to_exposure_us(self.spin_fps.value(), self._last_readout_sec)
+        self.spin_exposure.blockSignals(True)
+        self.spin_exposure.setValue(round(exp, 1))
+        self.spin_exposure.blockSignals(False)
 
     # ── State management ───────────────────────────────────────────
 
     def set_live_running(self, running: bool) -> None:
-        self.btn_start_live.setEnabled(not running)
-        self.btn_stop_live.setEnabled(running)
-        self.btn_start_rec.setEnabled(not running)
-        self._set_settings_editable(not running)
+        pass  # record button state is managed exclusively by set_recording()
 
-    def set_recording(self, recording: bool, target: int = 0) -> None:
-        self.btn_start_rec.setEnabled(not recording)
+    def set_recording(self, recording: bool) -> None:
         self.btn_stop_rec.setEnabled(recording)
-        self.progress_bar.setVisible(recording)
-        if recording:
-            self.progress_bar.setRange(0, target)
-            self.progress_bar.setValue(0)
-
-    def update_progress(self, written: int, target: int) -> None:
-        self.progress_bar.setRange(0, target)
-        self.progress_bar.setValue(written)
-
-    def _set_settings_editable(self, editable: bool) -> None:
-        for w in (self.spin_exposure, self.spin_fps, self.chk_fps,
-                  self.slider_gamma, self.chk_auto_gamma,
-                  self.spin_roi_x, self.spin_roi_y,
-                  self.spin_roi_w, self.spin_roi_h,
-                  self.combo_binning, self.spin_bundle,
-                  self.combo_readout, self.spin_trig_delay):
-            w.setEnabled(editable)
-        if editable:
-            self._on_fps_toggled(self.chk_fps.isChecked())
-            self.chk_auto_gamma.toggled.emit(self.chk_auto_gamma.isChecked())

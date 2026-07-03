@@ -62,3 +62,14 @@ class CameraStatusBar(QStatusBar):
 
     def set_info(self, text: str) -> None:
         self._info_label.setText(text)
+
+    def set_recording_complete(self, path: str, frames: int,
+                               duration_s: float, fps: float,
+                               dropped: int) -> None:
+        mins, secs = divmod(duration_s, 60)
+        drop_str = f"  ⚠ {dropped} dropped" if dropped > 0 else ""
+        self._info_label.setText(
+            f"Saved → {path}   |   "
+            f"{frames} frames  {int(mins):02d}:{secs:05.2f}  {fps:.1f} fps"
+            f"{drop_str}"
+        )

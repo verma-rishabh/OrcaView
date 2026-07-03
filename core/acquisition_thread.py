@@ -25,16 +25,20 @@ class AcquisitionThread(QThread):
     error_occurred = pyqtSignal(str)
 
     # Emit frame_ready every this many frames to avoid swamping Qt event loop
-    _SIGNAL_EVERY = 1
+    _SIGNAL_EVERY = 10
 
     def __init__(self, camera: DCAMCamera, ring_buffer: RingBuffer,
-                 fps_calc: FPSCalculator, parent=None):
+                 fps_calc: FPSCalculator, frame_bundle: int = 1,
+                 external_trigger: bool = False, parent=None):
         super().__init__(parent)
-        self._camera      = camera
-        self._buffer      = ring_buffer
-        self._fps_calc    = fps_calc
-        self._stop_flag   = threading.Event()
-        self._frame_count = 0
+        self._camera           = camera
+        self._buffer           = ring_buffer
+        self._fps_calc         = fps_calc
+        self._frame_bundle     = max(1, frame_bundle)
+        self._stop_flag        = threading.Event()
+        self._frame_count      = 0   # individual frames pushed (= DMA pushes × bundle)
+        self._dma_push_count   = 0   # DMA transfers we've successfully read
+        self._external_trigger = external_trigger
 
     def run(self) -> None:
         consecutive_timeouts = 0
@@ -43,7 +47,9 @@ class AcquisitionThread(QThread):
 
             if not got_frame:
                 consecutive_timeouts += 1
-                if consecutive_timeouts >= 25:  # 5 s with no frames
+                # In external trigger mode the camera legitimately waits for
+                # a hardware pulse, so don't treat timeouts as errors.
+                if not self._external_trigger and consecutive_timeouts >= 25:
                     self.error_occurred.emit(
                         "Camera timeout: no frames received for 5 seconds."
                     )
@@ -52,18 +58,25 @@ class AcquisitionThread(QThread):
 
             consecutive_timeouts = 0
             try:
-                frame = self._camera.copy_frame(frame_index=-1)
-                self._buffer.push(frame)
-                self._fps_calc.tick()
-                self._frame_count += 1
+                # Direct copy: DMA → ring-buffer slot (one copy, no temp array)
+                slot = self._buffer.begin_push()
+                ts, fs, cs = self._camera.lock_frame_into(slot, frame_index=-1)
+                self._buffer.end_push(ts, fs, cs)
+                self._dma_push_count += 1
+                for _ in range(self._frame_bundle):
+                    self._fps_calc.tick()
+                self._frame_count += self._frame_bundle
 
                 if self._frame_count % self._SIGNAL_EVERY == 0:
                     self.frame_ready.emit()
 
                 # Update stats every 30 frames to reduce overhead
                 if self._frame_count % 30 == 0:
-                    total, lost = self._camera.get_transfer_info()
-                    self.stats_updated.emit(total, lost)
+                    # camera_dma = DMA transfers the camera has captured;
+                    # dropped = transfers we missed × frames per transfer
+                    camera_dma, _ = self._camera.get_transfer_info()
+                    dropped = max(0, camera_dma - self._dma_push_count) * self._frame_bundle
+                    self.stats_updated.emit(self._frame_count, dropped)
 
             except Exception as exc:
                 self.error_occurred.emit(str(exc))
@@ -79,4 +92,5 @@ class AcquisitionThread(QThread):
 
     def reset(self) -> None:
         self._stop_flag.clear()
-        self._frame_count = 0
+        self._frame_count    = 0
+        self._dma_push_count = 0

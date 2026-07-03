@@ -43,34 +43,18 @@ class ROIOverlay:
         sensor_h = SENSOR_H // binning
         x, y, w, h = self._roi
 
-        # Scale ROI from sensor coords to widget pixels
-        sx = widget_rect.width()  / sensor_w
-        sy = widget_rect.height() / sensor_h
-        ox = widget_rect.x()
-        oy = widget_rect.y()
-
-        rx = int(ox + x * sx)
-        ry = int(oy + y * sy)
-        rw = max(1, int(w * sx))
-        rh = max(1, int(h * sy))
-
         # Only draw the overlay if ROI is not the full sensor
         full = (x == 0 and y == 0 and w == sensor_w and h == sensor_h)
+        if full:
+            return
 
-        # Outer dim rectangle (full sensor, dimmed)
-        if not full:
-            painter.save()
-            painter.setBrush(QColor(0, 0, 0, 80))
-            painter.setPen(Qt.PenStyle.NoPen)
-            painter.drawRect(widget_rect)
-
-            # Clear (restore) the ROI area so it appears undimmed
-            painter.setCompositionMode(
-                QPainter.CompositionMode.CompositionMode_Clear)
-            painter.drawRect(rx, ry, rw, rh)
-            painter.setCompositionMode(
-                QPainter.CompositionMode.CompositionMode_SourceOver)
-            painter.restore()
+        # The camera captures only the ROI crop — the displayed image IS the
+        # ROI, not the full sensor — so the ROI border maps to the entire
+        # image_rect (not a sensor-scaled sub-rectangle).
+        rx = widget_rect.x()
+        ry = widget_rect.y()
+        rw = widget_rect.width()
+        rh = widget_rect.height()
 
         # ROI border
         pen = QPen(QColor("#569cd6"), 1.5, Qt.PenStyle.SolidLine)
@@ -79,11 +63,12 @@ class ROIOverlay:
         painter.setBrush(Qt.BrushStyle.NoBrush)
         painter.drawRect(rx, ry, rw, rh)
 
-        # Corner label
+        # Corner label — include sensor offset so the user knows where on the
+        # sensor this ROI sits.
         painter.setPen(QColor("#569cd6"))
         font = painter.font()
         font.setPointSize(8)
         painter.setFont(font)
-        label = f"ROI {w}×{h}"
+        label = f"ROI {w}×{h}  @({x},{y})"
         painter.drawText(rx + 4, ry + 14, label)
         painter.restore()

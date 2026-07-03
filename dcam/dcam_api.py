@@ -66,8 +66,7 @@ class DCAMAPI:
         # Buffer allocation
         self.dcambuf_alloc     = self._fn("dcambuf_alloc",     [_c_void_p, _c_int32])
         self.dcambuf_lockframe = self._fn("dcambuf_lockframe", [_c_void_p, _P(DCAMBUF_FRAME)])
-        self.dcambuf_copyframe = self._fn("dcambuf_copyframe", [_c_void_p, _P(DCAMBUF_FRAME)])
-        self.dcambuf_free      = self._fn("dcambuf_free",      [_c_void_p])
+        self.dcambuf_release   = self._fn("dcambuf_release",   [_c_void_p, _c_int32])  # (h, iKind=0)
 
         # Capture control
         self.dcamcap_start        = self._fn("dcamcap_start",        [_c_void_p, _c_int32])
