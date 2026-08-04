@@ -20,7 +20,6 @@ from __future__ import annotations
 import json
 import os
 import threading
-import time
 from datetime import datetime
 
 import numpy as np
@@ -57,7 +56,8 @@ class WriterThread(QThread):
         try:
             os.makedirs(s.save_path, exist_ok=True)
             written = 0
-            t_start = time.monotonic()
+            first_ts = 0.0
+            last_ts  = 0.0
 
             bundle = max(1, s.frame_bundle)
             sub_h  = s.roi_height // max(1, s.binning)  # height of one sub-frame after binning
@@ -111,6 +111,9 @@ class WriterThread(QThread):
                         # in the bundle — the hardware stamp is per-DMA-transfer).
                         ts = float(buf.backing_timestamps[slot])
                         fs = int(buf.backing_frameindices[slot])
+                        if first_ts == 0.0:
+                            first_ts = ts
+                        last_ts = ts
 
                         for i in range(bundle):
                             # In non-drain mode, stop exactly at target.
@@ -149,7 +152,7 @@ class WriterThread(QThread):
                     if done:
                         break
 
-            duration = time.monotonic() - t_start
+            duration = last_ts - first_ts if last_ts > first_ts else 0.0
             self.write_complete.emit(stem, written, duration)
 
         except Exception as exc:

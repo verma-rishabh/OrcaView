@@ -229,6 +229,25 @@ class ControlPanel(QWidget):
             "free-runs until the Stop button is pressed.")
         form.addRow("Trigger:", self.combo_trig_source)
 
+        # Trigger edge polarity
+        self.combo_trig_polarity = QComboBox()
+        self.combo_trig_polarity.addItems(["Rising edge", "Falling edge"])
+        self.combo_trig_polarity.setToolTip(
+            "Which edge of the TTL pulse starts acquisition.\n"
+            "Rising = low→high, Falling = high→low.")
+        self.combo_trig_polarity.setEnabled(False)
+        form.addRow("Edge:", self.combo_trig_polarity)
+
+        # Recording duration
+        self.spin_duration_ms = QSpinBox()
+        self.spin_duration_ms.setRange(0, 3_600_000)
+        self.spin_duration_ms.setSuffix(" ms")
+        self.spin_duration_ms.setValue(10000)
+        self.spin_duration_ms.setToolTip(
+            "Recording duration in milliseconds.\n"
+            "0 = run until Stop button is pressed.")
+        form.addRow("Duration:", self.spin_duration_ms)
+
         self._layout.addWidget(box)
 
     def _build_actions(self):
@@ -241,7 +260,7 @@ class ControlPanel(QWidget):
         self.btn_stop_rec  = QPushButton("■ Stop Rec")
         self.btn_start_rec.setObjectName("btn_start_rec")
         self.btn_stop_rec.setObjectName("btn_stop_rec")
-        self.btn_stop_rec.setEnabled(False)
+        self.btn_stop_rec.hide()
         rec_row.addWidget(self.btn_start_rec)
         rec_row.addWidget(self.btn_stop_rec)
 
@@ -292,15 +311,15 @@ class ControlPanel(QWidget):
 
         # Combo changes apply immediately
         self.combo_binning.currentIndexChanged.connect(lambda _: _emit())
-        self.combo_trig_source.currentIndexChanged.connect(lambda _: _emit())
+        self.combo_trig_source.currentIndexChanged.connect(self._on_trig_source_changed)
 
         # Disable scroll-wheel value changes on all spinboxes and combo boxes
         self._no_scroll = _NoScroll(self)
         for w in (
             self.spin_exposure, self.spin_fps,
             self.spin_roi_x, self.spin_roi_y, self.spin_roi_w, self.spin_roi_h,
-            self.spin_bundle,
-            self.combo_binning, self.combo_trig_source,
+            self.spin_bundle, self.spin_duration_ms,
+            self.combo_binning, self.combo_trig_source, self.combo_trig_polarity,
         ):
             w.installEventFilter(self._no_scroll)
 
@@ -314,6 +333,12 @@ class ControlPanel(QWidget):
             self.edit_save_path.text() or os.path.expanduser("~"))
         if path:
             self.edit_save_path.setText(path)
+
+    def _on_trig_source_changed(self, idx: int) -> None:
+        is_external = (idx == 1)
+        self.combo_trig_polarity.setEnabled(is_external)
+        self.btn_start_rec.setText("⏺ Arm" if is_external else "⏺ Record")
+        self.settings_changed.emit(self.collect())
 
     def _center_roi_vertically(self) -> None:
         h = self.spin_roi_h.value()
@@ -329,7 +354,7 @@ class ControlPanel(QWidget):
     def populate(self, s: CameraSettings) -> None:
         """Push a CameraSettings object into all controls."""
         # Block signals that would fire settings_changed or exposure recompute
-        _block = (self.chk_fps, self.combo_binning, self.combo_trig_source)
+        _block = (self.chk_fps, self.combo_binning, self.combo_trig_source, self.combo_trig_polarity)
         for w in _block:
             w.blockSignals(True)
 
@@ -360,6 +385,12 @@ class ControlPanel(QWidget):
         self.edit_save_path.setText(s.save_path)
         # trigger_source: 1=Internal, 2=External → combo index 0/1
         self.combo_trig_source.setCurrentIndex(0 if s.trigger_source == 1 else 1)
+        is_external = (s.trigger_source == 2)
+        # polarity: 2=Positive(rising)→index 0, 1=Negative(falling)→index 1
+        self.combo_trig_polarity.setCurrentIndex(0 if s.trigger_polarity == 2 else 1)
+        self.combo_trig_polarity.setEnabled(is_external)
+        self.spin_duration_ms.setValue(s.record_duration_ms)
+        self.btn_start_rec.setText("⏺ Arm" if is_external else "⏺ Record")
 
         for w in _block:
             w.blockSignals(False)
@@ -372,21 +403,26 @@ class ControlPanel(QWidget):
         trig_src  = 1 if self.combo_trig_source.currentIndex() == 0 else 2
         # External trigger uses START mode (one pulse starts free-run sequence)
         trig_mode = 6 if trig_src == 2 else 1
+        # combo index 0 → Positive/rising (2), index 1 → Negative/falling (1)
+        trig_pol  = 2 if self.combo_trig_polarity.currentIndex() == 0 else 1
 
+        duration_ms = self.spin_duration_ms.value()
         s = CameraSettings(
-            exposure_us      = self.spin_exposure.value(),
-            fps_target       = fps_target,
-            gamma            = self.slider_gamma.value() / 100.0,
-            auto_gamma       = self.chk_auto_gamma.isChecked(),
-            roi_x            = self.spin_roi_x.value(),
-            roi_y            = self.spin_roi_y.value(),
-            roi_width        = self.spin_roi_w.value(),
-            roi_height       = self.spin_roi_h.value(),
-            binning          = binning,
-            frame_bundle     = self.spin_bundle.value(),
-            save_path        = self.edit_save_path.text() or "C:/data",
-            trigger_source   = trig_src,
-            trigger_mode     = trig_mode,
+            exposure_us         = self.spin_exposure.value(),
+            fps_target          = fps_target,
+            gamma               = self.slider_gamma.value() / 100.0,
+            auto_gamma          = self.chk_auto_gamma.isChecked(),
+            roi_x               = self.spin_roi_x.value(),
+            roi_y               = self.spin_roi_y.value(),
+            roi_width           = self.spin_roi_w.value(),
+            roi_height          = self.spin_roi_h.value(),
+            binning             = binning,
+            frame_bundle        = self.spin_bundle.value(),
+            save_path           = self.edit_save_path.text() or "C:/data",
+            trigger_source      = trig_src,
+            trigger_mode        = trig_mode,
+            trigger_polarity    = trig_pol,
+            record_duration_ms  = duration_ms,
         )
         s.align_roi()
         return s
@@ -423,4 +459,5 @@ class ControlPanel(QWidget):
         pass  # record button state is managed exclusively by set_recording()
 
     def set_recording(self, recording: bool) -> None:
-        self.btn_stop_rec.setEnabled(recording)
+        self.btn_start_rec.setVisible(not recording)
+        self.btn_stop_rec.setVisible(recording)

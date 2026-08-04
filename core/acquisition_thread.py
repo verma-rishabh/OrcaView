@@ -23,6 +23,7 @@ class AcquisitionThread(QThread):
     frame_ready    = pyqtSignal()
     stats_updated  = pyqtSignal(int, int)   # (total, lost)
     error_occurred = pyqtSignal(str)
+    trigger_fired  = pyqtSignal()            # emitted once on first frame in external trigger mode
 
     # Emit frame_ready every this many frames to avoid swamping Qt event loop
     _SIGNAL_EVERY = 10
@@ -57,6 +58,8 @@ class AcquisitionThread(QThread):
                 continue
 
             consecutive_timeouts = 0
+            if self._external_trigger and self._frame_count == 0:
+                self.trigger_fired.emit()
             try:
                 # Direct copy: DMA → ring-buffer slot (one copy, no temp array)
                 slot = self._buffer.begin_push()

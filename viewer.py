@@ -275,6 +275,7 @@ class RecordingViewer(QMainWindow):
         roi = requested.get("roi", {})
         w = int(actual.get("image_width",  roi.get("width",  pages[0].shape[1] if pages[0].ndim >= 2 else 0)))
         h = int(actual.get("image_height", roi.get("height", pages[0].shape[0] if pages[0].ndim >= 1 else 0)))
+        frame_bundle = int(actual.get("frame_bundle", requested.get("frame_bundle", 1)))
 
         # ── Per-page timestamps and frame indices ──────────────────────
         # Parse all page ImageDescriptions up-front (IFDs already loaded by tifffile).

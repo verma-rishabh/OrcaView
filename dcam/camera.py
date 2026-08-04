@@ -9,6 +9,8 @@ Ownership:
 """
 from __future__ import annotations
 import ctypes
+import logging
+import os
 from dataclasses import dataclass
 
 import numpy as np
@@ -27,7 +29,8 @@ from .dcam_types import (
     DCAM_IDPROP_FRAMEBUNDLE_MODE, DCAM_IDPROP_FRAMEBUNDLE_NUMBER,
     DCAM_IDPROP_FRAMEBUNDLE_FRAMESTEPBYTES,
     DCAM_IDPROP_TRIGGERSOURCE, DCAM_IDPROP_TRIGGER_MODE,
-    DCAM_IDPROP_TRIGGER_DELAY, DCAM_IDPROP_READOUTSPEED,
+    DCAM_IDPROP_TRIGGERPOLARITY, DCAM_IDPROP_TRIGGER_DELAY,
+    DCAM_IDPROP_READOUTSPEED,
     DCAM_IDPROP_IMAGE_WIDTH, DCAM_IDPROP_IMAGE_HEIGHT,
     DCAM_IDSTR_MODEL, DCAM_IDSTR_SERIALNUMBER,
     # Property values
@@ -37,14 +40,17 @@ from .dcam_types import (
     DCAMPROP_SUBARRAY_MODE__OFF, DCAMPROP_SUBARRAY_MODE__ON,
     DCAMPROP_READOUTSPEED__FASTEST,
     # Capture
-    DCAMCAP_START_SEQUENCE, DCAMWAIT_CAPEVENT_FRAMEREADY,
+    DCAMCAP_START_SEQUENCE, DCAMCAP_START_SNAP,
+    DCAMWAIT_CAPEVENT_FRAMEREADY,
     DCAMERR_SUCCESS,
 )
 
+log = logging.getLogger(__name__)
+
 _BINNING_MAP = {1: 1.0, 2: 2.0, 4: 4.0}
 
-# Set to True to print a readback comparison after every apply_settings() call.
-DEBUG_SETTINGS = False
+# Enable via DCAM_DEBUG_SETTINGS=1 environment variable.
+DEBUG_SETTINGS = os.environ.get("DCAM_DEBUG_SETTINGS", "").lower() in ("1", "true", "yes")
 
 
 @dataclass
@@ -252,9 +258,10 @@ class DCAMCamera:
         if not settings.auto_gamma:
             self._try_set(DCAM_IDPROP_GAMMA, settings.gamma)
 
-        # 9. Trigger source and mode
+        # 9. Trigger source, mode, and polarity
         self._set(DCAM_IDPROP_TRIGGERSOURCE, float(settings.trigger_source))
         self._set(DCAM_IDPROP_TRIGGER_MODE,  float(settings.trigger_mode))
+        self._try_set(DCAM_IDPROP_TRIGGERPOLARITY, float(settings.trigger_polarity))
 
         # 10. Trigger delay (optional)
         if settings.trigger_delay > 0:
@@ -335,34 +342,35 @@ class DCAMCamera:
     # Capture control
     # ------------------------------------------------------------------
 
-    def start_capture(self, n_buffer_frames: int = 100) -> None:
-        """Allocate DMA ring buffer and start free-running capture.
+    def start_capture(self, n_buffer_frames: int = 100, snap: bool = False) -> None:
+        """Allocate DMA buffer and start capture.
+
+        snap=False (SEQUENCE): continuous ring-buffer capture until dcamcap_stop().
+        snap=True  (SNAP):     capture exactly n_buffer_frames, then auto-stop.
+                               Use for external-trigger recording with a known
+                               frame count — the driver stops when the buffer
+                               is full, no software timer needed.
 
         Defensively stops any in-progress capture and releases any previously
-        allocated buffers first.  Both calls are idempotent per the SDK docs
-        (dcamcap_stop does nothing when already idle; dcambuf_release returns
-        a benign error when no buffer is allocated), so this is safe to call
-        even from a clean STABLE state.  This also recovers from sessions that
-        were terminated without calling stop_capture() — the DCAM driver
-        preserves device state across process boundaries.
+        allocated buffers first.  Both calls are idempotent per the SDK docs.
         """
         # Bring camera to STABLE state before allocating a fresh buffer.
         self._api.dcamcap_stop(self._hdcam)       # BUSY → READY (no-op if idle)
         self._api.dcambuf_release(self._hdcam, 0) # READY → STABLE (ignored if no buf)
         self._check(self._api.dcambuf_alloc(self._hdcam, n_buffer_frames),
                     "dcambuf_alloc")
-        self._check(self._api.dcamcap_start(self._hdcam, DCAMCAP_START_SEQUENCE),
+        mode = DCAMCAP_START_SNAP if snap else DCAMCAP_START_SEQUENCE
+        self._check(self._api.dcamcap_start(self._hdcam, mode),
                     "dcamcap_start")
 
     def stop_capture(self) -> None:
         """Stop capture and free DMA buffer."""
-        import sys
         err = self._api.dcamcap_stop(self._hdcam)
         if err != DCAMERR_SUCCESS:
-            print(f"[DCAM] dcamcap_stop warning: 0x{err & 0xFFFFFFFF:08X}", file=sys.stderr, flush=True)
+            log.debug("dcamcap_stop returned 0x%08X", err & 0xFFFFFFFF)
         err = self._api.dcambuf_release(self._hdcam, 0)   # iKind=0 required by SDK
         if err != DCAMERR_SUCCESS:
-            print(f"[DCAM] dcambuf_release warning: 0x{err & 0xFFFFFFFF:08X}", file=sys.stderr, flush=True)
+            log.debug("dcambuf_release returned 0x%08X", err & 0xFFFFFFFF)
 
     # ------------------------------------------------------------------
     # Frame retrieval

@@ -54,9 +54,11 @@ class CameraSettings:
     save_path:     str = "C:/data"
 
     # --- Trigger ---
-    trigger_source: int   = 1     # 1=Internal, 2=External
-    trigger_mode:   int   = 1     # 1=Normal (frame), 6=Start (sequence)
-    trigger_delay:  float = 0.0   # seconds
+    trigger_source:     int   = 1     # 1=Internal, 2=External
+    trigger_mode:       int   = 1     # 1=Normal (frame), 6=Start (sequence)
+    trigger_polarity:   int   = 2     # 1=Negative (falling edge), 2=Positive (rising edge)
+    trigger_delay:      float = 0.0   # seconds
+    record_duration_ms: int   = 0     # >0 = auto-stop after N ms (external trigger only)
 
     # ------------------------------------------------------------------
 

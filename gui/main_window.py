@@ -35,7 +35,6 @@ _LIVE_JSON    = os.path.join(_CONFIG_DIR, "live_mode.json")
 _RECORD_JSON  = os.path.join(_CONFIG_DIR, "record_mode.json")
 
 _DISPLAY_INTERVAL_MS = 16   # ~60 Hz display refresh
-_RECORD_DURATION_SEC = 10   # fixed experiment duration
 
 
 class MainWindow(QMainWindow):
@@ -68,7 +67,7 @@ class MainWindow(QMainWindow):
         splitter.addWidget(self._live_view)
         splitter.setStretchFactor(0, 0)   # panel: fixed preference
         splitter.setStretchFactor(1, 1)   # live view: takes all extra space
-        splitter.setSizes([360, 1040])
+        splitter.setSizes([480, 920])
         splitter.setHandleWidth(4)
         self.setCentralWidget(splitter)
 
@@ -76,6 +75,12 @@ class MainWindow(QMainWindow):
         self._display_timer = QTimer(self)
         self._display_timer.setInterval(_DISPLAY_INTERVAL_MS)
         self._display_timer.timeout.connect(self._refresh_display)
+
+        # ── Auto-stop timer (starts when external trigger fires) ─────
+        self._auto_stop_timer = QTimer(self)
+        self._auto_stop_timer.setSingleShot(True)
+        self._auto_stop_timer.timeout.connect(self._stop_record)
+        self._record_duration_ms = 0  # set by _start_record
 
         # ── Camera selector toolbar ──────────────────────────────────
         self._build_camera_toolbar()
@@ -245,6 +250,9 @@ class MainWindow(QMainWindow):
 
         s = self._panel.collect()
         s.align_roi()
+        # Live mode always uses internal trigger so the camera free-runs.
+        s.trigger_source = 1
+        s.trigger_mode   = 1
         self._settings = s
 
         try:
@@ -302,11 +310,12 @@ class MainWindow(QMainWindow):
             return
         # Disconnect before waiting so a slow exit can't emit stale error signals
         # that would kill a subsequently-started live session.
-        try:
-            self._acq.error_occurred.disconnect()
-            self._acq.stats_updated.disconnect()
-        except RuntimeError:
-            pass  # already disconnected
+        for sig in (self._acq.error_occurred, self._acq.stats_updated,
+                    self._acq.trigger_fired):
+            try:
+                sig.disconnect()
+            except (RuntimeError, TypeError):
+                pass
         self._acq.request_stop()
         self._acq.wait(3000)
         self._acq = None
@@ -361,10 +370,10 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Settings Error", str(exc))
             return
 
-        # Total sub-frames to record. fps_target is sub-frame fps;
-        # DMA rate = fps_target / bundle.
+        # Total sub-frames to record.
         bundle = max(1, s.frame_bundle)
-        num_frames = int(s.fps_target * _RECORD_DURATION_SEC)
+        duration_ms = s.record_duration_ms if s.record_duration_ms > 0 else 10_000
+        num_frames = max(1, int((s.fps_target or actual_fps) * duration_ms / 1000))
 
         # IMAGE_HEIGHT/WIDTH = one sub-frame. Ring buffer slot holds all bundle sub-frames.
         sub_h, sub_w   = self._camera.get_image_shape()
@@ -373,9 +382,11 @@ class MainWindow(QMainWindow):
         frame_shape    = (sub_h * actual_bundle, sub_w)
         self._single_frame_h = sub_h  # crop to first sub-frame for live display
 
-        # Size the ring buffer to hold the entire experiment.
+        # Size the ring buffer to hold the entire experiment plus 10% headroom
+        # so a slightly-higher-than-expected frame rate doesn't cause overwrites.
         # Each DMA slot holds `bundle` sub-frames stacked vertically.
-        capacity = (num_frames + bundle - 1) // bundle
+        dma_frames = (num_frames + bundle - 1) // bundle
+        capacity = int(dma_frames * 1.1) + 1
         ram_mb = capacity * frame_shape[0] * frame_shape[1] * 2 / 1024**2
         self._panel.set_camera_info(sub_w, sub_h, actual_binning, actual_bundle, ram_mb)
 
@@ -390,11 +401,18 @@ class MainWindow(QMainWindow):
 
         # Start acquisition
         self._fps_calc.reset()
+        is_ext_trig = (s.trigger_source == 2)
         self._acq = AcquisitionThread(self._camera, self._ring_buf, self._fps_calc,
                                       frame_bundle=s.frame_bundle,
-                                      external_trigger=(s.trigger_source == 2))
+                                      external_trigger=is_ext_trig)
         self._acq.error_occurred.connect(self._on_acq_error)
         self._acq.stats_updated.connect(self._on_stats_updated)
+
+        # When the external trigger fires (first frame arrives),
+        # start the auto-stop timer.
+        if is_ext_trig and s.record_duration_ms > 0:
+            self._record_duration_ms = s.record_duration_ms
+            self._acq.trigger_fired.connect(self._on_trigger_fired)
 
         # Start writer
         actual = {
@@ -426,11 +444,22 @@ class MainWindow(QMainWindow):
 
         self._panel.set_live_running(True)
         self._panel.set_recording(True)
+        if is_ext_trig and s.record_duration_ms > 0:
+            self._status_bar.set_mode("ARMED — waiting for trigger")
+        else:
+            self._status_bar.set_mode("RECORDING")
+
+    def _on_trigger_fired(self) -> None:
+        """Called when the first frame arrives in external trigger mode.
+        Starts the auto-stop countdown from this moment."""
+        self._auto_stop_timer.start(self._record_duration_ms)
         self._status_bar.set_mode("RECORDING")
 
     def _stop_record(self) -> None:
         if not self._rec_running:
             return
+
+        self._auto_stop_timer.stop()
 
         # Stop acquisition first so no new frames enter the ring buffer.
         self._stop_acq()
@@ -486,12 +515,16 @@ class MainWindow(QMainWindow):
 
         # --- Teardown (handles both natural completion and manual drain-stop) ---
         self._display_timer.stop()
+        self._auto_stop_timer.stop()
 
-        # Natural completion: acq is still running — stop it now.
-        self._stop_acq()
-
-        if self._camera and self._rec_running:
-            self._camera.stop_capture()
+        # Natural completion: acq thread is still running → stop it and the
+        # camera.  If _stop_record() already ran, _acq is None and the camera
+        # is already stopped — skip to avoid a double dcambuf_release which
+        # corrupts SDK state.
+        if self._acq is not None:
+            self._stop_acq()
+            if self._camera:
+                self._camera.stop_capture()
 
         # Writer thread just emitted this signal, so it has exited its run().
         # wait() returns immediately; we just need to release the object.

@@ -1,13 +1,18 @@
 {
-  "fps_target": 1000.0,
   "exposure_us": 734.0,
+  "fps_target": 1000.0,
   "gamma": 1.0,
   "auto_gamma": false,
   "roi_x": 0,
   "roi_y": 1024,
   "roi_width": 4096,
   "roi_height": 256,
-  "binning": 1,
+  "binning": 4,
   "frame_bundle": 4,
-  "save_path": "C:/test_camera"
+  "save_path": "C:/data",
+  "trigger_source": 1,
+  "trigger_mode": 1,
+  "trigger_polarity": 2,
+  "trigger_delay": 0.0,
+  "record_duration_ms": 10000
 }

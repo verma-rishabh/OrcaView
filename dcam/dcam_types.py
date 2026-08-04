@@ -110,6 +110,7 @@ DCAM_IDPROP_FRAMEBUNDLE_ROWBYTES      = 0x00421030  # R/O: actual rowbytes per r
 DCAM_IDPROP_FRAMEBUNDLE_FRAMESTEPBYTES= 0x00421040  # R/O: byte offset from one sub-frame to next
 DCAM_IDPROP_TRIGGERSOURCE        = 0x00100110
 DCAM_IDPROP_TRIGGER_MODE         = 0x00100210
+DCAM_IDPROP_TRIGGERPOLARITY      = 0x00100220
 DCAM_IDPROP_TRIGGER_DELAY        = 0x00100260
 DCAM_IDPROP_READOUTSPEED         = 0x00400110
 DCAM_IDPROP_IMAGE_WIDTH          = 0x00420210   # read-only after subarray set
@@ -124,6 +125,9 @@ DCAMPROP_TRIGGERSOURCE__SOFTWARE   = 3.0
 
 DCAMPROP_TRIGGER_MODE__NORMAL      = 1.0
 DCAMPROP_TRIGGER_MODE__START       = 6.0
+
+DCAMPROP_TRIGGERPOLARITY__NEGATIVE = 1.0   # falling edge
+DCAMPROP_TRIGGERPOLARITY__POSITIVE = 2.0   # rising edge
 
 DCAMPROP_MODE__OFF                 = 1.0
 DCAMPROP_MODE__ON                  = 2.0
@@ -142,6 +146,7 @@ DCAMPROP_READOUTSPEED__SLOWEST     = 1.0                  # SDK: 1
 # Capture / wait constants
 # ---------------------------------------------------------------------------
 DCAMCAP_START_SEQUENCE             = ctypes.c_int32(-1)
+DCAMCAP_START_SNAP                 = ctypes.c_int32(0)
 DCAMWAIT_CAPEVENT_FRAMEREADY       = 0x0002
 DCAMWAIT_CAPEVENT_STOPPED          = 0x0010
 DCAMWAIT_TIMEOUT_INFINITE          = 0x80000000
