@@ -57,7 +57,7 @@ No other dependencies — the output format is raw binary (no HDF5/TIFF librarie
 ## Running the Application
 
 ```bash
-cd DCAM
+cd OrcaView
 python main.py
 ```
 
@@ -299,7 +299,7 @@ Every frame carries two independent time references, both filled automatically b
 ## Project Structure
 
 ```
-DCAM/
+OrcaView/
 ├── main.py                      # Entry point: python main.py
 ├── requirements.txt             # PyQt6, numpy
 ├── config/
