@@ -35,12 +35,14 @@ class WriterThread(QThread):
     error_occurred   = pyqtSignal(str)
 
     def __init__(self, ring_buffer: RingBuffer, settings: CameraSettings,
-                 num_frames: int, actual: dict | None = None, parent=None):
+                 num_frames: int, actual: dict | None = None,
+                 stem_override: str | None = None, parent=None):
         super().__init__(parent)
         self._buffer     = ring_buffer
         self._settings   = settings
         self._num_frames = num_frames
         self._actual     = actual or {}
+        self._stem_override = stem_override
         self._stop_flag  = threading.Event()  # immediate abort
         self._drain_flag = threading.Event()  # drain buffer then stop
 
@@ -49,7 +51,7 @@ class WriterThread(QThread):
 
     def run(self) -> None:
         s = self._settings
-        stem = self._make_stem(s.save_path)
+        stem = self._stem_override or self._make_stem(s.save_path, s.file_prefix)
         target = self._num_frames
         tif_path = stem + ".tif"
 
@@ -171,7 +173,16 @@ class WriterThread(QThread):
         self._drain_flag.set()
 
     @staticmethod
-    def _make_stem(save_path: str) -> str:
+    def _make_stem(save_path: str, prefix: str = "") -> str:
         ts = datetime.now().strftime("%Y%m%d_%H%M%S")
         os.makedirs(save_path, exist_ok=True)
-        return os.path.join(save_path, f"recording_{ts}")
+        name = f"{prefix}_{ts}" if prefix else f"recording_{ts}"
+        return os.path.join(save_path, name)
+
+    @staticmethod
+    def make_session_dir(save_path: str) -> str:
+        """Create and return a burst session subfolder."""
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        d = os.path.join(save_path, f"burst_{ts}")
+        os.makedirs(d, exist_ok=True)
+        return d

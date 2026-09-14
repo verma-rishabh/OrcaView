@@ -42,6 +42,10 @@ class ControlPanel(QWidget):
 
     settings_changed   = pyqtSignal(object)   # CameraSettings
     auto_contrast_changed = pyqtSignal(bool)
+    reset_markers = pyqtSignal()
+    roi_mode_changed = pyqtSignal(bool)
+    reset_zoom = pyqtSignal()
+    stop_burst = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -164,8 +168,8 @@ class ControlPanel(QWidget):
         form.addRow("ROI  X:", self.spin_roi_x)
 
         self.spin_roi_y = QSpinBox()
-        self.spin_roi_y.setRange(0, 2302)
-        self.spin_roi_y.setToolTip("Vertical offset (multiple of 2)")
+        self.spin_roi_y.setRange(0, 2300)
+        self.spin_roi_y.setToolTip("Vertical offset (multiple of 4)")
         form.addRow("ROI  Y:", self.spin_roi_y)
 
         self.spin_roi_w = QSpinBox()
@@ -175,15 +179,28 @@ class ControlPanel(QWidget):
         form.addRow("ROI  W:", self.spin_roi_w)
 
         self.spin_roi_h = QSpinBox()
-        self.spin_roi_h.setRange(2, 2304)
+        self.spin_roi_h.setRange(4, 2304)
         self.spin_roi_h.setValue(2304)
-        self.spin_roi_h.setToolTip("Height in pixels (multiple of 2)  —  256 rows ≈ 1000 fps")
+        self.spin_roi_h.setToolTip("Height in pixels (multiple of 4)  —  256 rows ≈ 1000 fps")
         form.addRow("ROI  H:", self.spin_roi_h)
 
-        # Center ROI vertically helper button
-        self.btn_center_roi = QPushButton("Center vertically on sensor")
-        self.btn_center_roi.setToolTip("Sets Y offset so ROI is centred on the sensor")
-        form.addRow("", self.btn_center_roi)
+        # Reset cell markers
+        self.btn_reset_markers = QPushButton("Reset Markers")
+        self.btn_reset_markers.setToolTip("Remove all cell markers from the live view")
+        form.addRow("", self.btn_reset_markers)
+
+        # ROI edit mode toggle
+        self.chk_roi_mode = QCheckBox("ROI Edit Mode")
+        self.chk_roi_mode.setChecked(False)
+        self.chk_roi_mode.setToolTip(
+            "ON: mouse drags edit the ROI rectangle.\n"
+            "OFF: clicks place cell markers.")
+        form.addRow("", self.chk_roi_mode)
+
+        # Reset zoom
+        self.btn_reset_zoom = QPushButton("Reset Zoom")
+        self.btn_reset_zoom.setToolTip("Reset zoom and pan to fit-to-window")
+        form.addRow("", self.btn_reset_zoom)
 
         # Binning
         self.combo_binning = QComboBox()
@@ -204,6 +221,7 @@ class ControlPanel(QWidget):
 
     def _build_recording(self):
         box = QGroupBox("Recording")
+        self._recording_box = box
         form = QFormLayout(box)
         form.setLabelAlignment(Qt.AlignmentFlag.AlignRight)
         form.setVerticalSpacing(6)
@@ -219,6 +237,14 @@ class ControlPanel(QWidget):
         path_row.addWidget(self.edit_save_path)
         path_row.addWidget(self.btn_browse)
         form.addRow("Save path:", path_row)
+
+        # File name prefix
+        self.edit_file_prefix = QLineEdit()
+        self.edit_file_prefix.setPlaceholderText("(optional prefix)")
+        self.edit_file_prefix.setToolTip(
+            "Prepended to the recording filename.\n"
+            "Leave empty for default 'recording_YYYYMMDD_HHMMSS'.")
+        form.addRow("File prefix:", self.edit_file_prefix)
 
         # Trigger source for recording
         self.combo_trig_source = QComboBox()
@@ -238,6 +264,25 @@ class ControlPanel(QWidget):
         self.combo_trig_polarity.setEnabled(False)
         form.addRow("Edge:", self.combo_trig_polarity)
 
+        # Burst mode (repeat trigger)
+        burst_row = QHBoxLayout()
+        self.chk_burst_mode = QCheckBox("Burst")
+        self.chk_burst_mode.setToolTip(
+            "Auto re-arm after each recording.\n"
+            "Saves numbered files in a session subfolder.")
+        self.chk_burst_mode.setEnabled(False)
+        self.lbl_burst_count = QLabel("Saved: 0")
+        self.lbl_burst_count.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.lbl_burst_count.hide()
+        burst_row.addWidget(self.chk_burst_mode)
+        burst_row.addWidget(self.lbl_burst_count)
+        form.addRow("", burst_row)
+
+        self.btn_stop_burst = QPushButton("Stop Burst")
+        self.btn_stop_burst.setObjectName("btn_stop_burst")
+        self.btn_stop_burst.hide()
+        form.addRow("", self.btn_stop_burst)
+
         # Recording duration
         self.spin_duration_ms = QSpinBox()
         self.spin_duration_ms.setRange(0, 3_600_000)
@@ -252,6 +297,7 @@ class ControlPanel(QWidget):
 
     def _build_actions(self):
         box = QGroupBox("Control")
+        self._actions_box = box
         lay = QVBoxLayout(box)
         lay.setSpacing(6)
 
@@ -286,7 +332,10 @@ class ControlPanel(QWidget):
         self.btn_stop_rec.clicked.connect(self.stop_record)
 
         self.btn_browse.clicked.connect(self._browse_save_path)
-        self.btn_center_roi.clicked.connect(self._center_roi_vertically)
+        self.btn_reset_markers.clicked.connect(self.reset_markers)
+        self.chk_roi_mode.toggled.connect(lambda on: self.roi_mode_changed.emit(not on))
+        self.btn_reset_zoom.clicked.connect(self.reset_zoom)
+        self.btn_stop_burst.clicked.connect(self.stop_burst)
 
         self.chk_fps.toggled.connect(self._on_fps_toggled)
         self.chk_fps.toggled.connect(self._update_exposure_from_fps)
@@ -337,15 +386,11 @@ class ControlPanel(QWidget):
     def _on_trig_source_changed(self, idx: int) -> None:
         is_external = (idx == 1)
         self.combo_trig_polarity.setEnabled(is_external)
+        self.chk_burst_mode.setEnabled(is_external)
+        if not is_external:
+            self.chk_burst_mode.setChecked(False)
         self.btn_start_rec.setText("⏺ Arm" if is_external else "⏺ Record")
         self.settings_changed.emit(self.collect())
-
-    def _center_roi_vertically(self) -> None:
-        h = self.spin_roi_h.value()
-        sensor_h = 2304   # ROI is always in sensor pixel coordinates
-        y = (sensor_h - h) // 2
-        y = (y // 2) * 2   # align to multiple of 2
-        self.spin_roi_y.setValue(y)
 
     # ------------------------------------------------------------------
     # Public API — called by MainWindow
@@ -354,7 +399,8 @@ class ControlPanel(QWidget):
     def populate(self, s: CameraSettings) -> None:
         """Push a CameraSettings object into all controls."""
         # Block signals that would fire settings_changed or exposure recompute
-        _block = (self.chk_fps, self.combo_binning, self.combo_trig_source, self.combo_trig_polarity)
+        _block = (self.chk_fps, self.combo_binning, self.combo_trig_source,
+                  self.combo_trig_polarity, self.chk_burst_mode)
         for w in _block:
             w.blockSignals(True)
 
@@ -383,6 +429,7 @@ class ControlPanel(QWidget):
 
         self.spin_bundle.setValue(s.frame_bundle)
         self.edit_save_path.setText(s.save_path)
+        self.edit_file_prefix.setText(s.file_prefix)
         # trigger_source: 1=Internal, 2=External → combo index 0/1
         self.combo_trig_source.setCurrentIndex(0 if s.trigger_source == 1 else 1)
         is_external = (s.trigger_source == 2)
@@ -390,6 +437,8 @@ class ControlPanel(QWidget):
         self.combo_trig_polarity.setCurrentIndex(0 if s.trigger_polarity == 2 else 1)
         self.combo_trig_polarity.setEnabled(is_external)
         self.spin_duration_ms.setValue(s.record_duration_ms)
+        self.chk_burst_mode.setChecked(s.burst_mode)
+        self.chk_burst_mode.setEnabled(is_external)
         self.btn_start_rec.setText("⏺ Arm" if is_external else "⏺ Record")
 
         for w in _block:
@@ -419,10 +468,12 @@ class ControlPanel(QWidget):
             binning             = binning,
             frame_bundle        = self.spin_bundle.value(),
             save_path           = self.edit_save_path.text() or "C:/data",
+            file_prefix         = self.edit_file_prefix.text().strip(),
             trigger_source      = trig_src,
             trigger_mode        = trig_mode,
             trigger_polarity    = trig_pol,
             record_duration_ms  = duration_ms,
+            burst_mode          = self.chk_burst_mode.isChecked(),
         )
         s.align_roi()
         return s
@@ -456,8 +507,36 @@ class ControlPanel(QWidget):
     # ── State management ───────────────────────────────────────────
 
     def set_live_running(self, running: bool) -> None:
-        pass  # record button state is managed exclusively by set_recording()
+        """Show/hide recording controls based on whether we are in live-only mode."""
+        # During recording, set_recording(True) is also called, which shows the stop button.
+        # Here we just hide the recording group and action box when in pure live mode.
+        pass
+
+    def set_record_controls_visible(self, visible: bool) -> None:
+        """Show or hide the Recording group and Record button."""
+        self._recording_box.setVisible(visible)
+        self._actions_box.setVisible(visible)
 
     def set_recording(self, recording: bool) -> None:
         self.btn_start_rec.setVisible(not recording)
         self.btn_stop_rec.setVisible(recording)
+
+    def set_burst_active(self, active: bool) -> None:
+        self.lbl_burst_count.setVisible(active)
+        self.btn_stop_burst.setVisible(active)
+
+    def set_burst_count(self, n: int) -> None:
+        self.lbl_burst_count.setText(f"Saved: {n}")
+
+    def set_roi_preview(self, x: int, y: int, w: int, h: int) -> None:
+        """Update ROI spinboxes without triggering settings_changed."""
+        for spin in (self.spin_roi_x, self.spin_roi_y,
+                     self.spin_roi_w, self.spin_roi_h):
+            spin.blockSignals(True)
+        self.spin_roi_x.setValue(x)
+        self.spin_roi_y.setValue(y)
+        self.spin_roi_w.setValue(w)
+        self.spin_roi_h.setValue(h)
+        for spin in (self.spin_roi_x, self.spin_roi_y,
+                     self.spin_roi_w, self.spin_roi_h):
+            spin.blockSignals(False)

@@ -52,6 +52,7 @@ class CameraSettings:
 
     # --- Recording ---
     save_path:     str = "C:/data"
+    file_prefix:   str = ""       # prepended to recording filenames
 
     # --- Trigger ---
     trigger_source:     int   = 1     # 1=Internal, 2=External
@@ -59,24 +60,32 @@ class CameraSettings:
     trigger_polarity:   int   = 2     # 1=Negative (falling edge), 2=Positive (rising edge)
     trigger_delay:      float = 0.0   # seconds
     record_duration_ms: int   = 0     # >0 = auto-stop after N ms (external trigger only)
+    burst_mode:         bool  = False # auto re-arm after each external trigger recording
 
     # ------------------------------------------------------------------
 
     def align_roi(self) -> None:
         """
-        Enforce ORCA-Quest alignment constraints in-place:
-          H offset / width  → multiples of 4
-          V offset / height → multiples of 2
+        Enforce ORCA-Quest alignment constraints in-place.
+        Settings store ROI in sensor (1×1) pixel coordinates.
+        The SDK also uses sensor coordinates for subarray registers.
+        Values must be multiples of (base * binning) so that the sensor
+        region aligns to binned pixel boundaries:
+          H offset / width  → multiples of 4 * binning
+          V offset / height → multiples of 4 * binning
         """
-        self.roi_x      = _align(self.roi_x, 4)
-        self.roi_width  = max(4, _align(self.roi_width,  4))
-        self.roi_y      = _align(self.roi_y, 2)
-        self.roi_height = max(2, _align(self.roi_height, 2))
+        b  = self.binning
+        ha = 4 * b   # horizontal alignment
+        va = 4 * b   # vertical alignment (ORCA-Quest requires step of 4)
 
-        # Clamp within sensor bounds. ROI is always in sensor pixel coordinates;
-        # binning is independent and reduces output resolution, not ROI space.
-        self.roi_x      = min(self.roi_x,      4096 - 4)
-        self.roi_y      = min(self.roi_y,      2304 - 2)
+        self.roi_x      = _align(self.roi_x, ha)
+        self.roi_width  = max(ha, _align(self.roi_width,  ha))
+        self.roi_y      = _align(self.roi_y, va)
+        self.roi_height = max(va, _align(self.roi_height, va))
+
+        # Clamp within sensor bounds
+        self.roi_x      = min(self.roi_x,      4096 - ha)
+        self.roi_y      = min(self.roi_y,      2304 - va)
         self.roi_width  = min(self.roi_width,  4096 - self.roi_x)
         self.roi_height = min(self.roi_height, 2304 - self.roi_y)
 

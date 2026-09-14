@@ -65,6 +65,40 @@ On first launch the app connects to the camera automatically. If the camera is n
 
 ---
 
+## Screenshots
+
+### Live Mode — full sensor preview (4096 × 2304)
+
+![Live Mode](screenshots/04_live_mode_running.png)
+
+Live mode uses the full sensor at moderate frame rate. The settings panel on the left shows exposure, ROI, gamma, binning, and frame bundle controls. The status bar at the bottom shows `● LIVE`, measured FPS, the hardware timestamp of the last frame, and the dropped-frame counter.
+
+---
+
+### Record Mode preset — 256-row ROI at 1000 fps
+
+![Record Mode preset](screenshots/02_record_mode_preset.png)
+
+Clicking **Record Mode** loads `config/record_mode.json`: the ROI shrinks to 4096 × 256 centred vertically, FPS target is set to 1000, and the Recording section expands to show save path, trigger source, trigger edge, and duration controls. The blue stripe visible in the live view is the active ROI.
+
+---
+
+### Recording active
+
+![Recording active](screenshots/03_recording_active.png)
+
+While recording, the **⏺ Record** button is replaced by **■ Stop Rec** and the status bar switches to `● RECORDING` (red). Frames are streamed from the camera into the RAM ring buffer while the writer thread drains it to disk in parallel. The live view continues updating at 60 Hz.
+
+---
+
+### ROI Edit Mode
+
+![ROI Edit Mode](screenshots/05_roi_edit_mode.png)
+
+Checking **ROI Edit Mode** in the Image section lets you drag a new ROI directly on the live view. While active the cursor changes and the dragged rectangle is previewed in blue. On release the ROI spinboxes in the panel update and the camera restarts with the new region.
+
+---
+
 ## GUI Overview
 
 ```

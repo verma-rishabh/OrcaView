@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
 )
 
 from dcam.camera import DCAMCamera
+from dcam.debug_camera import DebugCamera
 from core.ring_buffer import RingBuffer
 from core.acquisition_thread import AcquisitionThread
 from core.writer_thread import WriterThread
@@ -55,6 +56,11 @@ class MainWindow(QMainWindow):
         self._rec_running    = False
         self._total_dropped  = 0
         self._single_frame_h = 0   # height of one un-bundled frame for display
+
+        # Burst mode state
+        self._burst_active   = False
+        self._session_dir:  str | None = None
+        self._burst_count    = 0
 
         # ── Widgets ──────────────────────────────────────────────────
         self._panel     = ControlPanel()
@@ -94,10 +100,18 @@ class MainWindow(QMainWindow):
         self._panel.settings_changed.connect(self._on_panel_settings_changed)
         self._panel.auto_contrast_changed.connect(self._live_view.set_auto_contrast)
         self._live_view.auto_contrast_done.connect(self._on_auto_contrast_done)
+        self._panel.reset_markers.connect(self._live_view.clear_markers)
+        self._panel.roi_mode_changed.connect(self._live_view.set_roi_mode)
+        self._panel.reset_zoom.connect(self._live_view.reset_zoom)
+        self._panel.stop_burst.connect(self._stop_burst)
+        self._live_view.roi_drag_update.connect(
+            lambda roi: self._panel.set_roi_preview(*roi))
+        self._live_view.roi_drag_finished.connect(self._on_roi_drag_finished)
 
         # ── Open camera on startup and begin live immediately ────────
         self._open_camera()
         self._panel.populate(self._settings)
+        self._panel.set_record_controls_visible(False)
         self._start_live()
 
     # ------------------------------------------------------------------
@@ -116,7 +130,7 @@ class MainWindow(QMainWindow):
         self._combo_camera.setToolTip("Select camera device")
         tb.addWidget(self._combo_camera)
 
-        self._btn_refresh_cameras = QPushButton("↺")
+        self._btn_refresh_cameras = QPushButton("\u21ba")
         self._btn_refresh_cameras.setFixedWidth(28)
         self._btn_refresh_cameras.setToolTip("Refresh camera list")
         self._btn_refresh_cameras.clicked.connect(self._refresh_camera_list)
@@ -132,23 +146,24 @@ class MainWindow(QMainWindow):
         if cameras:
             for idx, model, serial in cameras:
                 self._combo_camera.addItem(f"[{idx}] {model}  SN:{serial}", userData=idx)
-            # Pre-select whichever index is currently open
             if self._camera is not None:
                 self._combo_camera.setCurrentIndex(self._camera._index)
         else:
-            self._combo_camera.addItem("No cameras found", userData=-1)
+            self._combo_camera.addItem("[0] Debug Camera  (no hardware)", userData=-1)
         self._combo_camera.blockSignals(False)
 
     def _on_camera_selected(self, combo_index: int) -> None:
         device_index = self._combo_camera.itemData(combo_index)
-        if device_index is None or device_index < 0:
+        if device_index is None:
+            return
+        if device_index < 0:
+            # Debug camera entry — only selectable when already using debug
             return
         if self._camera is not None and self._camera._index == device_index:
             return
         if self._live_running or self._rec_running:
             QMessageBox.warning(self, "Busy",
                                 "Stop capture before switching cameras.")
-            # Restore combo to current camera
             if self._camera is not None:
                 self._combo_camera.blockSignals(True)
                 self._combo_camera.setCurrentIndex(self._camera._index)
@@ -181,17 +196,17 @@ class MainWindow(QMainWindow):
             model  = cam.get_model()
             serial = cam.get_serial()
             self._status_bar.set_info(f"{model}  SN: {serial}")
-            # Sync toolbar selection to device 0
             self._combo_camera.blockSignals(True)
             self._combo_camera.setCurrentIndex(0)
             self._combo_camera.blockSignals(False)
-        except RuntimeError as exc:
-            QMessageBox.critical(
-                self, "Camera Error",
-                f"Failed to open camera:\n\n{exc}\n\n"
-                "Ensure DCAM-SDK4 is installed and the camera is connected "
-                "via CoaXPress."
-            )
+        except RuntimeError:
+            cam = DebugCamera(device_index=0)
+            cam.open()
+            self._camera = cam
+            self._status_bar.set_info("Debug Camera (no hardware detected)")
+            self._combo_camera.blockSignals(True)
+            self._combo_camera.setCurrentIndex(0)
+            self._combo_camera.blockSignals(False)
 
     def _close_camera(self) -> None:
         if self._camera:
@@ -203,9 +218,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _load_live_preset(self) -> None:
+        self._live_view.clear_background()
+        self._panel.set_record_controls_visible(False)
         self._load_preset(_LIVE_JSON)
 
     def _load_record_preset(self) -> None:
+        # Capture the current live frame as background reference BEFORE
+        # switching to the recording preset (which may use a smaller ROI).
+        if self._live_running:
+            self._live_view.capture_background()
+        self._panel.set_record_controls_visible(True)
         self._load_preset(_RECORD_JSON)
 
     def _load_preset(self, path: str) -> None:
@@ -224,7 +246,6 @@ class MainWindow(QMainWindow):
         self._last_preset_path = path
         self._panel.populate(s)
 
-        # Restart live with the new settings
         self._stop_live()
         self._start_live()
 
@@ -233,7 +254,7 @@ class MainWindow(QMainWindow):
         try:
             s.to_json(self._last_preset_path)
             self._status_bar.set_info(
-                f"Settings saved → {os.path.basename(self._last_preset_path)}")
+                f"Settings saved \u2192 {os.path.basename(self._last_preset_path)}")
         except Exception as exc:
             QMessageBox.critical(self, "Save Error", str(exc))
 
@@ -250,7 +271,6 @@ class MainWindow(QMainWindow):
 
         s = self._panel.collect()
         s.align_roi()
-        # Live mode always uses internal trigger so the camera free-runs.
         s.trigger_source = 1
         s.trigger_mode   = 1
         self._settings = s
@@ -264,14 +284,13 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Settings Error", str(exc))
             return
 
-        # IMAGE_HEIGHT/WIDTH = one sub-frame. Ring buffer slot holds all bundle sub-frames.
         sub_h, sub_w   = self._camera.get_image_shape()
         actual_binning = self._camera.get_binning()
         actual_bundle  = self._camera.get_frame_bundle()
         frame_shape    = (sub_h * actual_bundle, sub_w)
-        self._single_frame_h = sub_h  # crop to first sub-frame for live display
+        self._single_frame_h = sub_h
 
-        capacity = 500   # live: small buffer, just for display
+        capacity = 500
         ram_mb = capacity * frame_shape[0] * frame_shape[1] * 2 / 1024**2
         self._panel.set_camera_info(sub_w, sub_h, actual_binning, actual_bundle, ram_mb)
         self._ring_buf = RingBuffer(
@@ -279,11 +298,9 @@ class MainWindow(QMainWindow):
             frame_shape=frame_shape,
         )
 
-        # Update live view ROI overlay
         self._live_view.set_roi(s.roi_x, s.roi_y, s.roi_width, s.roi_height)
         self._live_view.set_binning(s.binning)
 
-        # Start acquisition thread
         self._fps_calc.reset()
         self._acq = AcquisitionThread(self._camera, self._ring_buf, self._fps_calc,
                                       frame_bundle=s.frame_bundle)
@@ -294,7 +311,7 @@ class MainWindow(QMainWindow):
             self._camera.start_capture(n_buffer_frames=100)
         except RuntimeError as exc:
             QMessageBox.critical(self, "Capture Error", str(exc))
-            self._acq = None  # created above but never started; drop it cleanly
+            self._acq = None
             return
 
         self._acq.start()
@@ -305,11 +322,8 @@ class MainWindow(QMainWindow):
         self._status_bar.set_mode("LIVE")
 
     def _stop_acq(self) -> None:
-        """Disconnect signals, request stop, and wait for the acquisition thread."""
         if self._acq is None:
             return
-        # Disconnect before waiting so a slow exit can't emit stale error signals
-        # that would kill a subsequently-started live session.
         for sig in (self._acq.error_occurred, self._acq.stats_updated,
                     self._acq.trigger_fired):
             try:
@@ -346,7 +360,6 @@ class MainWindow(QMainWindow):
 
         if not s.save_path or not os.path.isdir(
                 os.path.dirname(os.path.abspath(s.save_path)) or "."):
-            # Try to create
             try:
                 os.makedirs(s.save_path, exist_ok=True)
             except Exception as exc:
@@ -355,7 +368,6 @@ class MainWindow(QMainWindow):
                 return
 
         if self._live_running:
-            # Stop live first, then restart in record mode
             self._stop_live()
 
         try:
@@ -363,28 +375,23 @@ class MainWindow(QMainWindow):
             rt = self._camera.get_readout_time()
             if s.fps_target:
                 s.resolve_exposure(rt)
-                self._camera.apply_settings(s)   # re-apply with resolved exposure
+                self._camera.apply_settings(s)
             actual_fps = self._camera.get_actual_fps()
             self._panel.set_readout_info(rt * 1e6, actual_fps)
         except RuntimeError as exc:
             QMessageBox.critical(self, "Settings Error", str(exc))
             return
 
-        # Total sub-frames to record.
         bundle = max(1, s.frame_bundle)
         duration_ms = s.record_duration_ms if s.record_duration_ms > 0 else 10_000
         num_frames = max(1, int((s.fps_target or actual_fps) * duration_ms / 1000))
 
-        # IMAGE_HEIGHT/WIDTH = one sub-frame. Ring buffer slot holds all bundle sub-frames.
         sub_h, sub_w   = self._camera.get_image_shape()
         actual_binning = self._camera.get_binning()
         actual_bundle  = self._camera.get_frame_bundle()
         frame_shape    = (sub_h * actual_bundle, sub_w)
-        self._single_frame_h = sub_h  # crop to first sub-frame for live display
+        self._single_frame_h = sub_h
 
-        # Size the ring buffer to hold the entire experiment plus 10% headroom
-        # so a slightly-higher-than-expected frame rate doesn't cause overwrites.
-        # Each DMA slot holds `bundle` sub-frames stacked vertically.
         dma_frames = (num_frames + bundle - 1) // bundle
         capacity = int(dma_frames * 1.1) + 1
         ram_mb = capacity * frame_shape[0] * frame_shape[1] * 2 / 1024**2
@@ -399,7 +406,6 @@ class MainWindow(QMainWindow):
         self._live_view.set_roi(s.roi_x, s.roi_y, s.roi_width, s.roi_height)
         self._live_view.set_binning(s.binning)
 
-        # Start acquisition
         self._fps_calc.reset()
         is_ext_trig = (s.trigger_source == 2)
         self._acq = AcquisitionThread(self._camera, self._ring_buf, self._fps_calc,
@@ -408,13 +414,23 @@ class MainWindow(QMainWindow):
         self._acq.error_occurred.connect(self._on_acq_error)
         self._acq.stats_updated.connect(self._on_stats_updated)
 
-        # When the external trigger fires (first frame arrives),
-        # start the auto-stop timer.
         if is_ext_trig and s.record_duration_ms > 0:
             self._record_duration_ms = s.record_duration_ms
             self._acq.trigger_fired.connect(self._on_trigger_fired)
 
-        # Start writer
+        # Burst mode: create session dir on first recording
+        stem_override = None
+        if s.burst_mode and is_ext_trig:
+            if self._session_dir is None:
+                self._session_dir = WriterThread.make_session_dir(s.save_path)
+                self._burst_count = 0
+            self._burst_count += 1
+            self._burst_active = True
+            self._panel.set_burst_active(True)
+            prefix = s.file_prefix or "recording"
+            stem_override = os.path.join(self._session_dir,
+                                         f"{prefix}_{self._burst_count:03d}")
+
         actual = {
             "fps":          actual_fps,
             "exposure_us":  self._camera.get_exposure_us(),
@@ -424,7 +440,8 @@ class MainWindow(QMainWindow):
             "image_height": sub_h,
             "image_width":  sub_w,
         }
-        self._writer = WriterThread(self._ring_buf, s, num_frames=num_frames, actual=actual)
+        self._writer = WriterThread(self._ring_buf, s, num_frames=num_frames,
+                                    actual=actual, stem_override=stem_override)
         self._writer.write_complete.connect(self._on_record_complete)
         self._writer.error_occurred.connect(self._on_write_error)
 
@@ -445,13 +462,12 @@ class MainWindow(QMainWindow):
         self._panel.set_live_running(True)
         self._panel.set_recording(True)
         if is_ext_trig and s.record_duration_ms > 0:
-            self._status_bar.set_mode("ARMED — waiting for trigger")
+            burst_info = f" (burst #{self._burst_count})" if self._burst_active else ""
+            self._status_bar.set_mode(f"ARMED \u2014 waiting for trigger{burst_info}")
         else:
             self._status_bar.set_mode("RECORDING")
 
     def _on_trigger_fired(self) -> None:
-        """Called when the first frame arrives in external trigger mode.
-        Starts the auto-stop countdown from this moment."""
         self._auto_stop_timer.start(self._record_duration_ms)
         self._status_bar.set_mode("RECORDING")
 
@@ -460,19 +476,23 @@ class MainWindow(QMainWindow):
             return
 
         self._auto_stop_timer.stop()
-
-        # Stop acquisition first so no new frames enter the ring buffer.
         self._stop_acq()
 
         if self._camera:
             self._camera.stop_capture()
 
-        # Ask the writer to drain whatever is left in the ring buffer, then
-        # emit write_complete.  _on_record_complete handles the final teardown.
         if self._writer:
             self._writer.request_drain_stop()
 
         self._status_bar.set_mode("DRAINING BUFFER...")
+
+    def _stop_burst(self) -> None:
+        """User-initiated burst stop — prevents re-arming after current recording."""
+        self._burst_active = False
+        self._session_dir = None
+        self._panel.set_burst_active(False)
+        if self._rec_running:
+            self._stop_record()
 
     # ------------------------------------------------------------------
     # Display refresh (GUI thread, 60 Hz)
@@ -513,21 +533,15 @@ class MainWindow(QMainWindow):
         fps     = frames / duration_s if duration_s > 0 else 0.0
         dropped = self._total_dropped
 
-        # --- Teardown (handles both natural completion and manual drain-stop) ---
+        # --- Teardown ---
         self._display_timer.stop()
         self._auto_stop_timer.stop()
 
-        # Natural completion: acq thread is still running → stop it and the
-        # camera.  If _stop_record() already ran, _acq is None and the camera
-        # is already stopped — skip to avoid a double dcambuf_release which
-        # corrupts SDK state.
         if self._acq is not None:
             self._stop_acq()
             if self._camera:
                 self._camera.stop_capture()
 
-        # Writer thread just emitted this signal, so it has exited its run().
-        # wait() returns immediately; we just need to release the object.
         if self._writer:
             self._writer.wait(5000)
             self._writer = None
@@ -542,7 +556,15 @@ class MainWindow(QMainWindow):
             fps=fps, dropped=dropped,
         )
 
-        # Return to live view
+        # Burst mode: auto re-arm instead of returning to live
+        if self._burst_active:
+            self._panel.set_burst_count(self._burst_count)
+            self._status_bar.set_info(
+                f"Recording {self._burst_count} saved. Re-arming...")
+            self._start_record()
+            return
+
+        # Normal mode: return to live and show dialog
         self._start_live()
 
         QMessageBox.information(
@@ -556,8 +578,14 @@ class MainWindow(QMainWindow):
             f"Dropped:   {dropped}",
         )
 
+    def _on_roi_drag_finished(self, roi: tuple) -> None:
+        x, y, w, h = roi
+        self._panel.set_roi_preview(x, y, w, h)
+        if not self._rec_running:
+            s = self._panel.collect()
+            self._on_panel_settings_changed(s)
+
     def _on_panel_settings_changed(self, s: CameraSettings) -> None:
-        """Re-apply camera settings immediately (live mode only; ignored during recording)."""
         if self._rec_running:
             return
         if self._live_running:
@@ -565,7 +593,6 @@ class MainWindow(QMainWindow):
             self._start_live()
 
     def _on_write_error(self, msg: str) -> None:
-        # Writer failed — tear down immediately without draining.
         self._display_timer.stop()
         self._stop_acq()
         if self._camera:
@@ -576,8 +603,11 @@ class MainWindow(QMainWindow):
             self._writer = None
         self._live_running = False
         self._rec_running  = False
+        self._burst_active = False
+        self._session_dir  = None
         self._panel.set_live_running(False)
         self._panel.set_recording(False)
+        self._panel.set_burst_active(False)
         self._status_bar.set_mode("IDLE")
         QMessageBox.critical(self, "Write Error", msg)
         self._start_live()
@@ -587,12 +617,11 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event) -> None:
-        """Safe shutdown: stop threads → release camera → dcamapi_uninit."""
+        self._burst_active = False  # prevent re-arming during shutdown
         if self._rec_running:
-            # Stop acq and trigger a buffer drain; then wait for writer to finish.
             self._stop_record()
             if self._writer:
-                self._writer.wait(300_000)  # up to 5 min to drain on close
+                self._writer.wait(300_000)
                 self._writer = None
         elif self._live_running:
             self._stop_live()

@@ -43,3 +43,18 @@ Thumbs.db
 *.dcimg
 *.tif
 *.tiff
+*.raw
+*.timestamps
+*.framestamps
+
+# Recording metadata that lands in the project dir by accident
+recording_*.meta.json
+
+# Accidental Windows-style paths created on Linux (e.g. C:/ from save_path default)
+C:/
+
+# Type checking cache
+.mypy_cache/
+
+# Dev / tooling scripts not meant for distribution
+take_screenshots.py

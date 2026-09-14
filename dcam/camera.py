@@ -211,15 +211,20 @@ class DCAMCamera:
         # 1. Disable frame bundle before changing geometry (not supported on all cameras)
         self._try_set(DCAM_IDPROP_FRAMEBUNDLE_MODE, DCAMPROP_MODE__OFF)
 
-        # 2. Disable subarray so dimension changes are accepted, then zero out
-        # the stored offsets before touching sizes.  The camera bounds-checks
-        # every property write as (current_offset + new_value <= sensor_size)
-        # even while subarray mode is OFF, so a non-zero offset left over from
-        # a previous ROI would cause "out-of-range" when we later try to
-        # widen HSIZE or VSIZE beyond (sensor_size - old_offset).
+        # 2. Disable subarray and reset geometry to a known-good state.
+        # The camera bounds-checks every property write as
+        #   (current_offset + new_value <= sensor_size)
+        # even while subarray mode is OFF.  We must zero out offsets FIRST
+        # (safe because any HSIZE fits at offset 0), then expand HSIZE/VSIZE
+        # to full sensor so that a subsequent binning change (which shrinks
+        # the effective sensor) doesn't leave stale oversized dimensions.
         self._set(DCAM_IDPROP_SUBARRAY_MODE, DCAMPROP_SUBARRAY_MODE__OFF)
         self._try_set(DCAM_IDPROP_SUBARRAYHPOS, 0.0)
         self._try_set(DCAM_IDPROP_SUBARRAYVPOS, 0.0)
+        # Expand to full sensor so the registers are consistent before
+        # the binning change.  Subarray registers use sensor (1×1) coords.
+        self._try_set(DCAM_IDPROP_SUBARRAYHSIZE, 4096.0)
+        self._try_set(DCAM_IDPROP_SUBARRAYVSIZE, 2304.0)
 
         # 3. Readout speed — always fastest for high-speed acquisition
         self._try_set(DCAM_IDPROP_READOUTSPEED, DCAMPROP_READOUTSPEED__FASTEST)
@@ -227,24 +232,26 @@ class DCAMCamera:
         # 4. Binning (changes effective sensor dimensions)
         self._set(DCAM_IDPROP_BINNING, _BINNING_MAP[settings.binning])
 
-        # 5. ROI (in sensor pixel coordinates — independent of binning)
-        # Binning reduces output resolution but does not change the ROI coordinate space.
-        is_full = (
-            settings.roi_x == 0 and settings.roi_y == 0
-            and settings.roi_width  == 4096
-            and settings.roi_height == 2304
-        )
+        # 5. ROI — subarray registers use sensor (1×1) pixel coordinates,
+        #    regardless of binning (per SDK sample binning_subarray.cpp).
+        roi_x = settings.roi_x
+        roi_y = settings.roi_y
+        roi_w = settings.roi_width
+        roi_h = settings.roi_height
+
+        is_full = (roi_x == 0 and roi_y == 0
+                   and roi_w == 4096 and roi_h == 2304)
         if not is_full:
             # Size must be set BEFORE offset: while subarray mode is OFF the
             # camera still bounds-checks each write against (current_offset +
             # new_value <= sensor_size), so writing the offset first against
             # the old (potentially full-sensor) size causes an out-of-range error.
-            self._set(DCAM_IDPROP_SUBARRAYHSIZE, float(settings.roi_width))
-            self._set(DCAM_IDPROP_SUBARRAYVSIZE, float(settings.roi_height))
-            self._set(DCAM_IDPROP_SUBARRAYHPOS,  float(settings.roi_x))
-            self._set(DCAM_IDPROP_SUBARRAYVPOS,  float(settings.roi_y))
+            self._set(DCAM_IDPROP_SUBARRAYHSIZE, float(roi_w))
+            self._set(DCAM_IDPROP_SUBARRAYVSIZE, float(roi_h))
+            self._set(DCAM_IDPROP_SUBARRAYHPOS,  float(roi_x))
+            self._set(DCAM_IDPROP_SUBARRAYVPOS,  float(roi_y))
             self._set(DCAM_IDPROP_SUBARRAY_MODE, DCAMPROP_SUBARRAY_MODE__ON)
-        # else: subarray mode stays OFF; camera uses full binned sensor dimensions.
+        # else: subarray mode stays OFF; camera uses full sensor.
 
         # 6. Frame bundle (after geometry is locked; silently ignored if not supported)
         if settings.frame_bundle > 1:
@@ -479,31 +486,33 @@ class DCAMCamera:
         cam_trig_mode   = int(self._get(DCAM_IDPROP_TRIGGER_MODE))
         cam_image_h, cam_image_w = self.get_image_shape()
 
-        # SUBARRAYHSIZE/VSIZE registers are only meaningful when subarray is ON.
-        # When subarray is OFF the camera uses full sensor dimensions regardless
-        # of what those registers hold (they may be stale from a prior ROI).
+        # Subarray registers use sensor (1×1) pixel coordinates.
         sub_on = (cam_subarray == 2)
+        exp_hpos  = settings.roi_x
+        exp_vpos  = settings.roi_y
+        exp_hsize = settings.roi_width
+        exp_vsize = settings.roi_height
         # IMAGE_WIDTH/HEIGHT are output (post-binning) pixels.
-        # Frame bundle stacks N roi_height rows into one DMA transfer.
-        expected_image_w = settings.roi_width  // settings.binning
-        expected_image_h = (settings.roi_height // settings.binning) * max(1, settings.frame_bundle)
+        b = settings.binning
+        expected_image_w = exp_hsize // b
+        expected_image_h = (exp_vsize // b) * max(1, settings.frame_bundle)
 
         rows = [
             ("exposure_us",   f"{settings.exposure_us:.1f}",  f"{cam_exposure_us:.1f}",
              abs(cam_exposure_us - settings.exposure_us) > 1.0),
             ("binning",       settings.binning,                cam_binning,
              cam_binning != settings.binning),
-            # Register checks only meaningful when subarray is ON
-            ("roi_x (hpos)",  settings.roi_x,                 cam_hpos,
-             sub_on and cam_hpos != settings.roi_x),
-            ("roi_y (vpos)",  settings.roi_y,                 cam_vpos,
-             sub_on and cam_vpos != settings.roi_y),
-            ("roi_w (hsize)", settings.roi_width,              cam_hsize,
-             sub_on and cam_hsize != settings.roi_width),
-            ("roi_h (vsize)", settings.roi_height,             cam_vsize,
-             sub_on and cam_vsize != settings.roi_height),
-            ("subarray_mode", "ON" if settings.roi_width != 4096//settings.binning
-                              or settings.roi_height != 2304//settings.binning
+            # Register checks only meaningful when subarray is ON (sensor coords)
+            ("roi_x (hpos)",  exp_hpos,                        cam_hpos,
+             sub_on and cam_hpos != exp_hpos),
+            ("roi_y (vpos)",  exp_vpos,                        cam_vpos,
+             sub_on and cam_vpos != exp_vpos),
+            ("roi_w (hsize)", exp_hsize,                       cam_hsize,
+             sub_on and cam_hsize != exp_hsize),
+            ("roi_h (vsize)", exp_vsize,                       cam_vsize,
+             sub_on and cam_vsize != exp_vsize),
+            ("subarray_mode", "ON" if exp_hsize != 4096
+                              or exp_vsize != 2304
                               else "OFF",
              "ON" if sub_on else "OFF",
              False),
