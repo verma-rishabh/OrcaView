@@ -1,32 +1,11 @@
 """
 CameraSettings dataclass with JSON serialization.
-Handles FPS→exposure conversion on load.
 """
 from __future__ import annotations
 import dataclasses
 import json
 import os
 from dataclasses import dataclass, field
-from typing import Optional
-
-
-def fps_to_exposure_us(fps: float, readout_time_sec: float) -> float:
-    """
-    Calculate exposure time (µs) to achieve the desired FPS.
-
-    frame_period = exposure_time + readout_time
-    → exposure = frame_period - readout_time
-
-    readout_time must be queried from the camera AFTER setting ROI and binning
-    via DCAM_IDPROP_TIMING_READOUTTIME, because it changes with ROI height.
-
-    Example: 4096×256 ROI at 1000 fps
-        readout_time ≈ (256/2304) × 2.4 ms ≈ 266 µs
-        exposure     = 1000 µs − 266 µs    = 734 µs
-    """
-    frame_period_sec = 1.0 / max(fps, 0.001)
-    exposure_sec = frame_period_sec - readout_time_sec
-    return max(1.0, exposure_sec * 1e6)
 
 
 def _align(value: int, multiple: int) -> int:
@@ -36,13 +15,10 @@ def _align(value: int, multiple: int) -> int:
 
 @dataclass
 class CameraSettings:
-    # --- Exposure / FPS ---
-    exposure_us: float        = 1000.0    # microseconds; authoritative
-    fps_target:  Optional[float] = None   # if set, overrides exposure on load
+    # --- Exposure ---
+    exposure_us: float = 1000.0    # microseconds
 
     # --- Image ---
-    gamma:      float = 1.0
-    auto_gamma: bool  = False
     roi_x:      int   = 0
     roi_y:      int   = 0
     roi_width:  int   = 4096
@@ -88,16 +64,6 @@ class CameraSettings:
         self.roi_y      = min(self.roi_y,      2304 - va)
         self.roi_width  = min(self.roi_width,  4096 - self.roi_x)
         self.roi_height = min(self.roi_height, 2304 - self.roi_y)
-
-    def resolve_exposure(self, readout_time_sec: float) -> None:
-        """
-        If fps_target is set, compute and overwrite exposure_us.
-        Must be called after apply_settings() (which sets ROI/binning on
-        camera) so that readout_time reflects current configuration.
-        """
-        if self.fps_target is not None and self.fps_target > 0:
-            self.exposure_us = fps_to_exposure_us(self.fps_target,
-                                                  readout_time_sec)
 
     # ------------------------------------------------------------------
     # Serialization

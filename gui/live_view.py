@@ -31,7 +31,6 @@ _DRAG_THRESHOLD = 5  # pixels before a press becomes a drag
 
 
 class LiveViewWidget(QWidget):
-    auto_contrast_done = pyqtSignal()
     roi_drag_update   = pyqtSignal(tuple)
     roi_drag_finished = pyqtSignal(tuple)
 
@@ -42,9 +41,12 @@ class LiveViewWidget(QWidget):
         self._markers:       CellMarkerOverlay = CellMarkerOverlay()
         self._roi_handler:   ROIInteractionHandler = ROIInteractionHandler()
         self._binning:       int            = 1
-        self._capture_next:  bool           = False
-        self._ac_lo:         float          = 0.0
-        self._ac_hi:         float          = 0.0
+        self._gamma:         float          = 1.0   # display gamma
+        self._auto_gamma:    bool           = False
+        self._ag_interval:   int            = 5     # recompute every N frames
+        self._ag_counter:    int            = 0
+        self._ag_lo:         float          = 0.0   # auto-computed percentile range
+        self._ag_hi:         float          = 0.0
 
         # Full-sensor coordinate system
         self._roi_sensor: tuple[int, int, int, int] = (0, 0, SENSOR_W, SENSOR_H)
@@ -68,7 +70,7 @@ class LiveViewWidget(QWidget):
         self._marker_preview_radius: int = 0  # widget pixels
 
         # Mode toggle
-        self._roi_mode: bool = False
+        self._roi_mode: bool = True
 
         self.setMinimumSize(640, 360)
         self.setStyleSheet("background-color: #111111;")
@@ -78,26 +80,48 @@ class LiveViewWidget(QWidget):
     # Public API
     # ------------------------------------------------------------------
 
-    def set_auto_contrast(self, enabled: bool) -> None:
-        self._capture_next = enabled
+    def set_gamma(self, value: float) -> None:
+        """Software display gamma (1.0 = linear)."""
+        self._gamma = max(0.1, min(4.0, value))
+
+    def set_auto_gamma(self, enabled: bool) -> None:
+        self._auto_gamma = enabled
+        self._ag_counter = 0
+        if not enabled:
+            self._ag_lo, self._ag_hi = 0.0, 0.0
+
+    def set_auto_gamma_interval(self, n: int) -> None:
+        self._ag_interval = max(1, n)
+        self._ag_counter = 0
 
     def update_frame(self, pixels: np.ndarray) -> None:
-        if self._capture_next:
-            sample = pixels[::8, ::8]
-            lo = float(np.percentile(sample, 0.5))
-            hi = float(np.percentile(sample, 99.5))
-            if hi > lo:
-                self._ac_lo, self._ac_hi = lo, hi
-            self._capture_next = False
-            self.auto_contrast_done.emit()
+        # Auto gamma: periodically compute optimal gamma from percentile range
+        if self._auto_gamma:
+            self._ag_counter += 1
+            if self._ag_counter >= self._ag_interval:
+                self._ag_counter = 0
+                sample = pixels[::8, ::8]
+                lo = float(np.percentile(sample, 0.5))
+                hi = float(np.percentile(sample, 99.5))
+                if hi > lo:
+                    self._ag_lo, self._ag_hi = lo, hi
 
-        if self._ac_hi > self._ac_lo:
-            arr8 = np.clip(
-                (pixels.astype(np.float32) - self._ac_lo) * (255.0 / (self._ac_hi - self._ac_lo)),
-                0, 255,
-            ).astype(np.uint8)
+        # Convert 16-bit to float [0, 1]
+        if self._ag_hi > self._ag_lo:
+            # Auto: stretch percentile range to [0, 1] first
+            frame = np.clip(
+                (pixels.astype(np.float32) - self._ag_lo) / (self._ag_hi - self._ag_lo),
+                0.0, 1.0,
+            )
         else:
-            arr8 = (pixels >> 8).astype(np.uint8)
+            frame = pixels.astype(np.float32) / 65535.0
+
+        # Apply gamma power curve
+        gamma = self._gamma
+        if abs(gamma - 1.0) > 1e-3:
+            np.power(frame, 1.0 / gamma, out=frame)
+
+        arr8 = (frame * 255.0).astype(np.uint8)
         h, w = arr8.shape
         qimg = QImage(arr8.data, w, h, w, QImage.Format.Format_Grayscale8)
         self._pixmap = QPixmap.fromImage(qimg)

@@ -35,13 +35,16 @@ class ControlPanel(QWidget):
     # ── Signals emitted to MainWindow ─────────────────────────────
     load_live_preset   = pyqtSignal()
     load_record_preset = pyqtSignal()
+    load_custom_preset = pyqtSignal(str)   # path to JSON file
     save_settings      = pyqtSignal()
 
     start_record  = pyqtSignal()
     stop_record   = pyqtSignal()
 
     settings_changed   = pyqtSignal(object)   # CameraSettings
-    auto_contrast_changed = pyqtSignal(bool)
+    auto_gamma_changed  = pyqtSignal(bool)
+    gamma_changed       = pyqtSignal(float)    # 0.10–4.00
+    ac_interval_changed = pyqtSignal(int)
     reset_markers = pyqtSignal()
     roi_mode_changed = pyqtSignal(bool)
     reset_zoom = pyqtSignal()
@@ -62,7 +65,6 @@ class ControlPanel(QWidget):
         self._layout.setSpacing(10)
         self._layout.setContentsMargins(10, 10, 10, 10)
 
-        self._last_readout_sec = 0.0   # cached from last camera query
 
         self._build_presets()
         self._build_exposure()
@@ -88,17 +90,36 @@ class ControlPanel(QWidget):
         lay.setSpacing(8)
         lay.setContentsMargins(8, 12, 8, 8)
 
-        self.btn_live_preset   = QPushButton("Live Mode")
-        self.btn_record_preset = QPushButton("Record Mode")
+        # Live row
+        live_row = QHBoxLayout()
+        live_row.setSpacing(4)
+        self.btn_live_preset = QPushButton("Live Mode")
         self.btn_live_preset.setObjectName("btn_live_preset")
-        self.btn_record_preset.setObjectName("btn_record_preset")
         self.btn_live_preset.setToolTip(
             "Load live_mode.json: full sensor, high exposure, no frame bundle")
+        self.btn_live_browse = QPushButton("...")
+        self.btn_live_browse.setObjectName("btn_preset_browse")
+        self.btn_live_browse.setFixedWidth(30)
+        self.btn_live_browse.setToolTip("Load a custom JSON preset for live mode")
+        live_row.addWidget(self.btn_live_preset, stretch=1)
+        live_row.addWidget(self.btn_live_browse)
+        lay.addLayout(live_row)
+
+        # Record row
+        rec_row = QHBoxLayout()
+        rec_row.setSpacing(4)
+        self.btn_record_preset = QPushButton("Record Mode")
+        self.btn_record_preset.setObjectName("btn_record_preset")
         self.btn_record_preset.setToolTip(
             "Load record_mode.json: 4096×256 ROI, 1000 fps, frame bundle")
+        self.btn_record_browse = QPushButton("...")
+        self.btn_record_browse.setObjectName("btn_preset_browse")
+        self.btn_record_browse.setFixedWidth(30)
+        self.btn_record_browse.setToolTip("Load a custom JSON preset for record mode")
+        rec_row.addWidget(self.btn_record_preset, stretch=1)
+        rec_row.addWidget(self.btn_record_browse)
+        lay.addLayout(rec_row)
 
-        lay.addWidget(self.btn_live_preset)
-        lay.addWidget(self.btn_record_preset)
         self._layout.addWidget(box)
 
     def _build_exposure(self):
@@ -109,27 +130,21 @@ class ControlPanel(QWidget):
         form.setHorizontalSpacing(10)
 
         # Exposure
+        exp_row = QHBoxLayout()
+        exp_row.setSpacing(6)
+        self.slider_exposure = QSlider(Qt.Orientation.Horizontal)
+        self.slider_exposure.setRange(0, 1000)  # mapped logarithmically
+        self.slider_exposure.setValue(500)
+        self.slider_exposure.setToolTip("Exposure time (logarithmic scale)")
         self.spin_exposure = QDoubleSpinBox()
         self.spin_exposure.setRange(1.0, 1_000_000.0)
         self.spin_exposure.setDecimals(1)
         self.spin_exposure.setSuffix(" µs")
         self.spin_exposure.setToolTip("Exposure time in microseconds")
-        form.addRow("Exposure:", self.spin_exposure)
-
-        # FPS target
-        fps_row = QHBoxLayout()
-        self.chk_fps = QCheckBox("Enable")
-        self.chk_fps.setToolTip(
-            "When enabled, exposure is auto-calculated from FPS target.\n"
-            "Requires applying settings to query camera readout time.")
-        self.spin_fps = QDoubleSpinBox()
-        self.spin_fps.setRange(0.1, 10_000.0)
-        self.spin_fps.setDecimals(1)
-        self.spin_fps.setSuffix(" fps")
-        self.spin_fps.setEnabled(False)
-        fps_row.addWidget(self.chk_fps)
-        fps_row.addWidget(self.spin_fps)
-        form.addRow("FPS Target:", fps_row)
+        self.spin_exposure.setFixedWidth(110)
+        exp_row.addWidget(self.slider_exposure, stretch=1)
+        exp_row.addWidget(self.spin_exposure)
+        form.addRow("Exposure:", exp_row)
 
         self.lbl_readout_info = QLabel("Readout: — µs | Max: — fps")
         form.addRow("", self.lbl_readout_info)
@@ -147,7 +162,7 @@ class ControlPanel(QWidget):
         form.setVerticalSpacing(6)
         form.setHorizontalSpacing(10)
 
-        # Gamma
+        # Gamma (display only — software power curve)
         gamma_row = QHBoxLayout()
         gamma_row.setSpacing(6)
         self.slider_gamma = QSlider(Qt.Orientation.Horizontal)
@@ -156,10 +171,23 @@ class ControlPanel(QWidget):
         self.lbl_gamma = QLabel("1.00")
         self.lbl_gamma.setMinimumWidth(36)
         self.chk_auto_gamma = QCheckBox("Auto")
+        self.chk_auto_gamma.setToolTip("Continuously auto-adjust gamma (display only)")
         gamma_row.addWidget(self.slider_gamma, stretch=1)
         gamma_row.addWidget(self.lbl_gamma)
         gamma_row.addWidget(self.chk_auto_gamma)
         form.addRow("Gamma:", gamma_row)
+
+        # Auto gamma interval
+        ac_interval_row = QHBoxLayout()
+        ac_interval_row.setSpacing(6)
+        self.spin_ac_interval = QSpinBox()
+        self.spin_ac_interval.setRange(1, 100)
+        self.spin_ac_interval.setValue(5)
+        self.spin_ac_interval.setToolTip("Recalculate auto gamma every N frames")
+        ac_interval_row.addWidget(self.spin_ac_interval)
+        ac_interval_row.addWidget(QLabel("frames"))
+        ac_interval_row.addStretch()
+        form.addRow("", ac_interval_row)
 
         # ROI — one field per row so each spinbox has full width
         self.spin_roi_x = QSpinBox()
@@ -310,14 +338,15 @@ class ControlPanel(QWidget):
         rec_row.addWidget(self.btn_start_rec)
         rec_row.addWidget(self.btn_stop_rec)
 
+        lay.addLayout(rec_row)
+        self._layout.addWidget(box)
+
+        # Save button — always visible (not inside recording group)
         self.btn_save_settings = QPushButton("💾 Save Settings")
         self.btn_save_settings.setObjectName("btn_save_settings")
         self.btn_save_settings.setToolTip(
-            "Save current settings to the last-loaded preset file")
-
-        lay.addLayout(rec_row)
-        lay.addWidget(self.btn_save_settings)
-        self._layout.addWidget(box)
+            "Save current settings to a JSON file")
+        self._layout.addWidget(self.btn_save_settings)
 
     # ------------------------------------------------------------------
     # Internal signal wiring
@@ -326,6 +355,8 @@ class ControlPanel(QWidget):
     def _wire_signals(self):
         self.btn_live_preset.clicked.connect(self.load_live_preset)
         self.btn_record_preset.clicked.connect(self.load_record_preset)
+        self.btn_live_browse.clicked.connect(lambda: self._browse_preset("live"))
+        self.btn_record_browse.clicked.connect(lambda: self._browse_preset("record"))
         self.btn_save_settings.clicked.connect(self.save_settings)
 
         self.btn_start_rec.clicked.connect(self.start_record)
@@ -337,14 +368,49 @@ class ControlPanel(QWidget):
         self.btn_reset_zoom.clicked.connect(self.reset_zoom)
         self.btn_stop_burst.clicked.connect(self.stop_burst)
 
-        self.chk_fps.toggled.connect(self._on_fps_toggled)
-        self.chk_fps.toggled.connect(self._update_exposure_from_fps)
-        self.chk_fps.toggled.connect(lambda: self.settings_changed.emit(self.collect()))
+        # Exposure slider ↔ spinbox sync (logarithmic)
+        import math
+        _EXP_MIN_LOG = math.log10(1.0)       # 1 µs
+        _EXP_MAX_LOG = math.log10(1_000_000)  # 1 s
+        _EXP_RANGE   = 1000                   # slider steps
+
+        def _exp_slider_to_us(v: int) -> float:
+            return 10 ** (_EXP_MIN_LOG + (v / _EXP_RANGE) * (_EXP_MAX_LOG - _EXP_MIN_LOG))
+
+        def _exp_us_to_slider(us: float) -> int:
+            us = max(1.0, min(1_000_000.0, us))
+            return int(((math.log10(us) - _EXP_MIN_LOG) / (_EXP_MAX_LOG - _EXP_MIN_LOG)) * _EXP_RANGE)
+
+        self._syncing_exposure = False
+
+        def _on_exp_slider(v: int):
+            if self._syncing_exposure:
+                return
+            self._syncing_exposure = True
+            self.spin_exposure.setValue(round(_exp_slider_to_us(v), 1))
+            self._syncing_exposure = False
+
+        def _on_exp_spin():
+            if self._syncing_exposure:
+                return
+            self._syncing_exposure = True
+            self.slider_exposure.setValue(_exp_us_to_slider(self.spin_exposure.value()))
+            self._syncing_exposure = False
+
+        self.slider_exposure.valueChanged.connect(_on_exp_slider)
+        self.spin_exposure.valueChanged.connect(lambda _: _on_exp_spin())
+        self.slider_exposure.sliderReleased.connect(lambda: _emit())
+        self.slider_exposure.valueChanged.connect(
+            lambda _: _emit() if not self.slider_exposure.isSliderDown() else None)
+        # Store for use in populate
+        self._exp_us_to_slider = _exp_us_to_slider
+
         self.slider_gamma.valueChanged.connect(
             lambda v: self.lbl_gamma.setText(f"{v / 100:.2f}"))
-        self.chk_auto_gamma.toggled.connect(
-            lambda on: self.slider_gamma.setEnabled(not on))
-        self.chk_auto_gamma.toggled.connect(self.auto_contrast_changed)
+        self.slider_gamma.valueChanged.connect(
+            lambda v: self.gamma_changed.emit(v / 100.0))
+        self.chk_auto_gamma.toggled.connect(self.auto_gamma_changed)
+        self.spin_ac_interval.valueChanged.connect(self.ac_interval_changed)
 
         # Apply settings on Enter (editingFinished) for all camera-affecting spinboxes
         def _emit():
@@ -355,9 +421,6 @@ class ControlPanel(QWidget):
                   self.spin_bundle):
             w.editingFinished.connect(_emit)
 
-        self.spin_fps.editingFinished.connect(self._update_exposure_from_fps)
-        self.spin_fps.editingFinished.connect(_emit)
-
         # Combo changes apply immediately
         self.combo_binning.currentIndexChanged.connect(lambda _: _emit())
         self.combo_trig_source.currentIndexChanged.connect(self._on_trig_source_changed)
@@ -365,16 +428,31 @@ class ControlPanel(QWidget):
         # Disable scroll-wheel value changes on all spinboxes and combo boxes
         self._no_scroll = _NoScroll(self)
         for w in (
-            self.spin_exposure, self.spin_fps,
+            self.spin_exposure,
             self.spin_roi_x, self.spin_roi_y, self.spin_roi_w, self.spin_roi_h,
             self.spin_bundle, self.spin_duration_ms,
             self.combo_binning, self.combo_trig_source, self.combo_trig_polarity,
         ):
             w.installEventFilter(self._no_scroll)
 
-    def _on_fps_toggled(self, checked: bool) -> None:
-        self.spin_fps.setEnabled(checked)
-        self.spin_exposure.setEnabled(not checked)
+    def _browse_preset(self, mode: str) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, f"Select {mode} preset",
+            os.path.join(os.path.dirname(__file__), "..", "config"),
+            "JSON files (*.json)")
+        if path:
+            self.load_custom_preset.emit(path)
+
+    def set_active_preset(self, mode: str) -> None:
+        """Dim the inactive preset button, highlight the active one."""
+        is_live = (mode == "live")
+        self.btn_live_preset.setProperty("active", is_live)
+        self.btn_record_preset.setProperty("active", not is_live)
+        # Force style refresh
+        self.btn_live_preset.style().unpolish(self.btn_live_preset)
+        self.btn_live_preset.style().polish(self.btn_live_preset)
+        self.btn_record_preset.style().unpolish(self.btn_record_preset)
+        self.btn_record_preset.style().polish(self.btn_record_preset)
 
     def _browse_save_path(self) -> None:
         path = QFileDialog.getExistingDirectory(
@@ -399,25 +477,14 @@ class ControlPanel(QWidget):
     def populate(self, s: CameraSettings) -> None:
         """Push a CameraSettings object into all controls."""
         # Block signals that would fire settings_changed or exposure recompute
-        _block = (self.chk_fps, self.combo_binning, self.combo_trig_source,
-                  self.combo_trig_polarity, self.chk_burst_mode)
+        _block = (self.combo_binning, self.combo_trig_source,
+                  self.combo_trig_polarity, self.chk_burst_mode,
+                  self.slider_exposure)
         for w in _block:
             w.blockSignals(True)
 
         self.spin_exposure.setValue(s.exposure_us)
-
-        if s.fps_target is not None:
-            self.chk_fps.setChecked(True)
-            self.spin_fps.setValue(s.fps_target)
-            self.spin_fps.setEnabled(True)
-            self.spin_exposure.setEnabled(False)
-        else:
-            self.chk_fps.setChecked(False)
-            self.spin_fps.setEnabled(False)
-            self.spin_exposure.setEnabled(True)
-
-        self.slider_gamma.setValue(int(s.gamma * 100))
-        self.chk_auto_gamma.setChecked(s.auto_gamma)
+        self.slider_exposure.setValue(self._exp_us_to_slider(s.exposure_us))
 
         self.spin_roi_x.setValue(s.roi_x)
         self.spin_roi_y.setValue(s.roi_y)
@@ -447,7 +514,6 @@ class ControlPanel(QWidget):
     def collect(self) -> CameraSettings:
         """Read all controls and return a CameraSettings object."""
         binning = [1, 2, 4][self.combo_binning.currentIndex()]
-        fps_target = self.spin_fps.value() if self.chk_fps.isChecked() else None
         # combo index 0 → Internal (1), index 1 → External (2)
         trig_src  = 1 if self.combo_trig_source.currentIndex() == 0 else 2
         # External trigger uses START mode (one pulse starts free-run sequence)
@@ -458,9 +524,6 @@ class ControlPanel(QWidget):
         duration_ms = self.spin_duration_ms.value()
         s = CameraSettings(
             exposure_us         = self.spin_exposure.value(),
-            fps_target          = fps_target,
-            gamma               = self.slider_gamma.value() / 100.0,
-            auto_gamma          = self.chk_auto_gamma.isChecked(),
             roi_x               = self.spin_roi_x.value(),
             roi_y               = self.spin_roi_y.value(),
             roi_width           = self.spin_roi_w.value(),
@@ -487,22 +550,9 @@ class ControlPanel(QWidget):
         )
 
     def set_readout_info(self, readout_us: float, actual_fps: float) -> None:
-        self._last_readout_sec = readout_us / 1e6
         self.lbl_readout_info.setText(
             f"Readout: {readout_us:.0f} µs | Max: {actual_fps:.1f} fps"
         )
-        # Recompute exposure now that we have an accurate readout time
-        self._update_exposure_from_fps()
-
-    def _update_exposure_from_fps(self) -> None:
-        """If FPS mode is active and readout time is known, update the exposure spinbox."""
-        if not self.chk_fps.isChecked() or self._last_readout_sec <= 0:
-            return
-        from core.settings import fps_to_exposure_us
-        exp = fps_to_exposure_us(self.spin_fps.value(), self._last_readout_sec)
-        self.spin_exposure.blockSignals(True)
-        self.spin_exposure.setValue(round(exp, 1))
-        self.spin_exposure.blockSignals(False)
 
     # ── State management ───────────────────────────────────────────
 

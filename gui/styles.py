@@ -49,6 +49,11 @@ QPushButton#btn_live_preset {
     padding: 8px 14px;
 }
 QPushButton#btn_live_preset:hover { background-color: #1e4a70; }
+QPushButton#btn_live_preset[active="false"] {
+    background-color: #141f2a;
+    border-color: #1a3a5c;
+    color: #4a6a8a;
+}
 
 QPushButton#btn_record_preset {
     background-color: #3a1a1a;
@@ -59,6 +64,16 @@ QPushButton#btn_record_preset {
     padding: 8px 14px;
 }
 QPushButton#btn_record_preset:hover { background-color: #501e1e; }
+QPushButton#btn_record_preset[active="false"] {
+    background-color: #1f1414;
+    border-color: #3a1a1a;
+    color: #6a4a5a;
+}
+
+QPushButton#btn_preset_browse {
+    padding: 4px;
+    font-size: 9pt;
+}
 
 /* Action buttons */
 QPushButton#btn_start_live {

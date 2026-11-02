@@ -17,6 +17,7 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout,
     QMessageBox, QLabel, QSplitter,
     QToolBar, QComboBox, QPushButton,
+    QFileDialog,
 )
 
 from dcam.camera import DCAMCamera
@@ -32,8 +33,9 @@ from gui.live_view import LiveViewWidget
 from gui.status_bar import CameraStatusBar
 
 _CONFIG_DIR   = os.path.join(os.path.dirname(__file__), "..", "config")
-_LIVE_JSON    = os.path.join(_CONFIG_DIR, "live_mode.json")
-_RECORD_JSON  = os.path.join(_CONFIG_DIR, "record_mode.json")
+_LIVE_JSON    = os.path.join(_CONFIG_DIR, "default_live_mode.json")
+_RECORD_JSON  = os.path.join(_CONFIG_DIR, "default_record_mode.json")
+_PROTECTED    = {"default_live_mode.json", "default_record_mode.json"}
 
 _DISPLAY_INTERVAL_MS = 16   # ~60 Hz display refresh
 
@@ -94,12 +96,14 @@ class MainWindow(QMainWindow):
         # ── Wire panel signals ───────────────────────────────────────
         self._panel.load_live_preset.connect(self._load_live_preset)
         self._panel.load_record_preset.connect(self._load_record_preset)
+        self._panel.load_custom_preset.connect(self._load_custom_preset)
         self._panel.save_settings.connect(self._save_settings)
         self._panel.start_record.connect(self._start_record)
         self._panel.stop_record.connect(self._stop_record)
         self._panel.settings_changed.connect(self._on_panel_settings_changed)
-        self._panel.auto_contrast_changed.connect(self._live_view.set_auto_contrast)
-        self._live_view.auto_contrast_done.connect(self._on_auto_contrast_done)
+        self._panel.gamma_changed.connect(self._live_view.set_gamma)
+        self._panel.auto_gamma_changed.connect(self._live_view.set_auto_gamma)
+        self._panel.ac_interval_changed.connect(self._live_view.set_auto_gamma_interval)
         self._panel.reset_markers.connect(self._live_view.clear_markers)
         self._panel.roi_mode_changed.connect(self._live_view.set_roi_mode)
         self._panel.reset_zoom.connect(self._live_view.reset_zoom)
@@ -112,6 +116,7 @@ class MainWindow(QMainWindow):
         self._open_camera()
         self._panel.populate(self._settings)
         self._panel.set_record_controls_visible(False)
+        self._panel.set_active_preset("live")
         self._start_live()
 
     # ------------------------------------------------------------------
@@ -220,6 +225,7 @@ class MainWindow(QMainWindow):
     def _load_live_preset(self) -> None:
         self._live_view.clear_background()
         self._panel.set_record_controls_visible(False)
+        self._panel.set_active_preset("live")
         self._load_preset(_LIVE_JSON)
 
     def _load_record_preset(self) -> None:
@@ -228,7 +234,11 @@ class MainWindow(QMainWindow):
         if self._live_running:
             self._live_view.capture_background()
         self._panel.set_record_controls_visible(True)
+        self._panel.set_active_preset("record")
         self._load_preset(_RECORD_JSON)
+
+    def _load_custom_preset(self, path: str) -> None:
+        self._load_preset(path)
 
     def _load_preset(self, path: str) -> None:
         if self._rec_running:
@@ -250,11 +260,23 @@ class MainWindow(QMainWindow):
         self._start_live()
 
     def _save_settings(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Settings",
+            _CONFIG_DIR,
+            "JSON files (*.json)")
+        if not path:
+            return
+        if os.path.basename(path) in _PROTECTED:
+            QMessageBox.warning(self, "Protected Preset",
+                                "Cannot overwrite default presets.\n"
+                                "Choose a different name.")
+            return
         s = self._panel.collect()
         try:
-            s.to_json(self._last_preset_path)
+            s.to_json(path)
+            self._last_preset_path = path
             self._status_bar.set_info(
-                f"Settings saved \u2192 {os.path.basename(self._last_preset_path)}")
+                f"Settings saved \u2192 {os.path.basename(path)}")
         except Exception as exc:
             QMessageBox.critical(self, "Save Error", str(exc))
 
@@ -373,9 +395,6 @@ class MainWindow(QMainWindow):
         try:
             self._camera.apply_settings(s)
             rt = self._camera.get_readout_time()
-            if s.fps_target:
-                s.resolve_exposure(rt)
-                self._camera.apply_settings(s)
             actual_fps = self._camera.get_actual_fps()
             self._panel.set_readout_info(rt * 1e6, actual_fps)
         except RuntimeError as exc:
@@ -384,7 +403,7 @@ class MainWindow(QMainWindow):
 
         bundle = max(1, s.frame_bundle)
         duration_ms = s.record_duration_ms if s.record_duration_ms > 0 else 10_000
-        num_frames = max(1, int((s.fps_target or actual_fps) * duration_ms / 1000))
+        num_frames = max(1, int(actual_fps * duration_ms / 1000))
 
         sub_h, sub_w   = self._camera.get_image_shape()
         actual_binning = self._camera.get_binning()
@@ -517,11 +536,6 @@ class MainWindow(QMainWindow):
     # Signals from threads
     # ------------------------------------------------------------------
 
-    def _on_auto_contrast_done(self) -> None:
-        self._panel.chk_auto_gamma.blockSignals(True)
-        self._panel.chk_auto_gamma.setChecked(False)
-        self._panel.chk_auto_gamma.blockSignals(False)
-
     def _on_stats_updated(self, total: int, lost: int) -> None:
         self._total_dropped = lost
 
@@ -555,6 +569,13 @@ class MainWindow(QMainWindow):
             path=stem, frames=frames, duration_s=duration_s,
             fps=fps, dropped=dropped,
         )
+
+        # Empty recording (e.g. burst re-arm that was stopped before trigger)
+        if frames == 0:
+            if self._burst_active:
+                self._burst_count -= 1  # undo the pre-increment
+            self._start_live()
+            return
 
         # Burst mode: auto re-arm instead of returning to live
         if self._burst_active:

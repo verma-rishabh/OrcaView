@@ -21,7 +21,7 @@ from .dcam_types import (
     DCAMBUF_FRAME, DCAMWAIT_OPEN, DCAMWAIT_START,
     DCAMCAP_TRANSFERINFO, DCAMPROP_ATTR,
     # Property IDs
-    DCAM_IDPROP_EXPOSURETIME, DCAM_IDPROP_GAMMA,
+    DCAM_IDPROP_EXPOSURETIME,
     DCAM_IDPROP_TIMING_READOUTTIME, DCAM_IDPROP_TIMING_FRAMERATE,
     DCAM_IDPROP_SUBARRAY_MODE, DCAM_IDPROP_SUBARRAYHPOS,
     DCAM_IDPROP_SUBARRAYVPOS, DCAM_IDPROP_SUBARRAYHSIZE,
@@ -261,11 +261,7 @@ class DCAMCamera:
         # 7. Exposure (seconds)
         self._set(DCAM_IDPROP_EXPOSURETIME, settings.exposure_us * 1e-6)
 
-        # 8. Gamma (optional — not supported in all modes)
-        if not settings.auto_gamma:
-            self._try_set(DCAM_IDPROP_GAMMA, settings.gamma)
-
-        # 9. Trigger source, mode, and polarity
+        # 8. Trigger source, mode, and polarity
         self._set(DCAM_IDPROP_TRIGGERSOURCE, float(settings.trigger_source))
         self._set(DCAM_IDPROP_TRIGGER_MODE,  float(settings.trigger_mode))
         self._try_set(DCAM_IDPROP_TRIGGERPOLARITY, float(settings.trigger_polarity))

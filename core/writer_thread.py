@@ -72,7 +72,6 @@ class WriterThread(QThread):
                 "requested": {
                     "roi":            {"x": s.roi_x, "y": s.roi_y,
                                        "width": s.roi_width, "height": s.roi_height},
-                    "fps_target":     s.fps_target,
                     "exposure_us":    s.exposure_us,
                     "binning":        s.binning,
                     "frame_bundle":   s.frame_bundle,
@@ -155,6 +154,11 @@ class WriterThread(QThread):
                         break
 
             duration = last_ts - first_ts if last_ts > first_ts else 0.0
+
+            # Clean up empty file (e.g. burst re-arm that never received a trigger)
+            if written == 0 and os.path.isfile(tif_path):
+                os.remove(tif_path)
+
             self.write_complete.emit(stem, written, duration)
 
         except Exception as exc:

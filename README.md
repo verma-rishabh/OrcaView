@@ -1,298 +1,289 @@
-# ORCA-Quest C15550-20UP Camera GUI
+# OrcaView
 
-Desktop application for live preview and high-speed recording from the Hamamatsu ORCA-Quest qCMOS camera via CoaXPress on Windows.
+Desktop application for live preview and high-speed recording from the Hamamatsu ORCA-Quest qCMOS camera via CoaXPress.
 
----
-
-## Hardware Requirements
-
-| Component | Requirement |
-|---|---|
-| Camera | Hamamatsu C15550-20UP (ORCA-Quest) |
-| Interface | CoaXPress Quad CXP-6 frame grabber (PCIe) |
-| OS | Windows 10 or Windows 11 (64-bit) |
-| RAM | ≥ 16 GB recommended (recording buffer uses up to ~4 GB) |
-| Storage | **NVMe SSD required** for recording at 1000+ fps (needs ~2 GB/s sustained write) |
-
-> USB 3.1 mode is limited to ~17 fps and **cannot** reach 1000+ fps. CoaXPress is mandatory.
+![Live Mode](screenshots/01_live_mode.png)
 
 ---
 
-## Driver & SDK Installation
+## Getting Started
 
-### 1. DCAM-SDK4 (mandatory)
+### Requirements
 
-Download from [dcam-api.com](https://dcam-api.com/dcam-sdk-login-2/) — free, requires registration.
+- **Camera:** Hamamatsu C15550-20UP (ORCA-Quest) with CoaXPress Quad CXP-6 frame grabber
+- **OS:** Windows 10/11 (64-bit)
+- **RAM:** 16 GB+ recommended
+- **Storage:** NVMe SSD for recording at 1000+ fps (~2 GB/s sustained write)
 
-The installer places `dcamapi.dll` on the system PATH. This DLL is the only runtime dependency needed by this application.
+### Installation
 
-Alternatively, `dcamapi.dll` is bundled with Hamamatsu's own software (HoKaWo, HiPic) if you have either installed.
-
-### 2. CoaXPress Frame Grabber Driver
-
-Install the driver provided with your specific frame grabber card. Verified compatible brands:
-- Active Silicon
-- Euresys
-- BitFlow
-
-After installing the frame grabber driver, connect the camera with all four CXP-6 cables (Quad CXP-6 = 4× coaxial cables). The DCAM-API will detect the camera automatically once both drivers are installed.
-
-### 3. Verify Installation
-
-Open **HoKaWo** (included with DCAM-SDK4) and confirm the camera appears and shows a live image before running this application.
-
----
-
-## Python Setup
+1. Install [DCAM-SDK4](https://dcam-api.com/dcam-sdk-login-2/) (places `dcamapi.dll` on the system PATH)
+2. Install your CoaXPress frame grabber driver (Active Silicon, Euresys, or BitFlow)
+3. Connect all four CXP-6 cables
+4. Verify the camera works in HoKaWo (bundled with DCAM-SDK4)
 
 ```bash
-# Python 3.10 or newer recommended
-pip install PyQt6 numpy
-```
-
-No other dependencies — the output format is raw binary (no HDF5/TIFF libraries needed).
-
----
-
-## Running the Application
-
-```bash
-cd OrcaView
+pip install PyQt6 numpy tifffile
 python main.py
 ```
 
-On first launch the app connects to the camera automatically. If the camera is not found, a dialog explains what is missing and the app remains open.
+On launch, the app connects to the camera and starts live preview automatically. If no camera is found, a debug camera is used.
 
 ---
 
-## Screenshots
+## Live Mode
 
-### Live Mode — full sensor preview (4096 × 2304)
+When the app starts, it loads the **Live Mode** preset and begins streaming from the full sensor (4096 x 2304). Use this for alignment, focusing, and sample positioning.
 
-![Live Mode](screenshots/04_live_mode_running.png)
+![Live Mode — full sensor preview](screenshots/01_live_mode.png)
 
-Live mode uses the full sensor at moderate frame rate. The settings panel on the left shows exposure, ROI, gamma, binning, and frame bundle controls. The status bar at the bottom shows `● LIVE`, measured FPS, the hardware timestamp of the last frame, and the dropped-frame counter.
+The left panel shows all camera controls. The live view fills the rest of the window and scales to fit while preserving the aspect ratio.
 
----
+### Navigation
 
-### Record Mode preset — 256-row ROI at 1000 fps
+- **Scroll wheel** — zoom in/out (cursor-centered)
+- **Middle-click drag** — pan the view
+- **Reset Zoom** button — fit image back to window
 
-![Record Mode preset](screenshots/02_record_mode_preset.png)
+### Display Controls
 
-Clicking **Record Mode** loads `config/record_mode.json`: the ROI shrinks to 4096 × 256 centred vertically, FPS target is set to 1000, and the Recording section expands to show save path, trigger source, trigger edge, and duration controls. The blue stripe visible in the live view is the active ROI.
+- **Gamma slider** — software display gamma (does not affect recorded data). Values below 1.0 brighten shadows, above 1.0 compresses highlights.
+- **Auto checkbox** — continuously auto-adjusts display contrast using frame percentiles. The interval spinbox controls how often it recalculates.
 
----
+### Cell Markers
 
-### Recording active
-
-![Recording active](screenshots/03_recording_active.png)
-
-While recording, the **⏺ Record** button is replaced by **■ Stop Rec** and the status bar switches to `● RECORDING` (red). Frames are streamed from the camera into the RAM ring buffer while the writer thread drains it to disk in parallel. The live view continues updating at 60 Hz.
-
----
-
-### ROI Edit Mode
-
-![ROI Edit Mode](screenshots/05_roi_edit_mode.png)
-
-Checking **ROI Edit Mode** in the Image section lets you drag a new ROI directly on the live view. While active the cursor changes and the dragged rectangle is previewed in blue. On release the ROI spinboxes in the panel update and the camera restarts with the new region.
+With **ROI Edit Mode** unchecked, clicking on the live view places a circular marker. Click-drag to set the marker size. Right-click a marker to remove it. Use **Reset Markers** to clear all.
 
 ---
 
-## GUI Overview
+## Record Mode
 
-```
-┌──────────────────────┬─────────────────────────────────────────┐
-│   Settings Panel     │                                         │
-│   (left, fixed)      │         Live View                       │
-│                      │   (scales to window, keeps aspect)      │
-│  [Live Mode]         │                                         │
-│  [Record Mode]       │   ROI overlay drawn in blue             │
-│                      │                                         │
-│  Exposure / FPS      │                                         │
-│  Image settings      │                                         │
-│  Recording           │                                         │
-│  Advanced            │                                         │
-│  Control buttons     │                                         │
-└──────────────────────┴─────────────────────────────────────────┘
-│  ● LIVE   FPS: 1000.0   TS: 14:32:01.005   Dropped: 0        │
-└───────────────────────────────────────────────────────────────┘
-```
+Click **Record Mode** to load the recording preset. The ROI shrinks (default: 4096 x 256, centered vertically), and the Recording controls appear.
 
----
+![Record Mode — ROI with recording controls](screenshots/02_record_mode.png)
 
-## Settings Reference
+The blue overlay on the live view shows the active ROI region. A frozen background from live mode provides spatial context so you can see where on the sensor the ROI sits.
 
-### Preset Buttons
+### Setting Up a Recording
 
-| Button | What it loads |
+1. **Exposure slider** — set exposure time in microseconds (logarithmic scale). The readout info line shows the resulting max FPS.
+2. **ROI fields** — adjust X, Y, W, H to define the sensor region. Smaller height = higher frame rate.
+3. **Frame Bundle** — groups multiple frames per DMA transfer. Use 2+ for 1000+ fps throughput.
+4. **Binning** — 1x1, 2x2, or 4x4 pixel binning. Always set before changing ROI.
+5. **Save path** — folder where recordings are written. Click **...** to browse.
+6. **File prefix** — optional prefix prepended to the filename (default: `recording_YYYYMMDD_HHMMSS`).
+7. **Duration** — recording length in milliseconds. 0 = run until Stop is pressed.
+
+### ROI Editing
+
+Check **ROI Edit Mode** to drag-edit the ROI rectangle directly on the live view. You can move the rectangle or resize it from edges and corners. The ROI spinboxes update in real time as you drag. On release, the camera restarts with the new region.
+
+### Starting a Recording
+
+![Recording controls](screenshots/02_record_mode.png)
+
+Click **Record** (or **Arm** for external trigger) to begin. The status bar switches to **RECORDING**. Frames stream into a RAM ring buffer while the writer thread drains it to disk in parallel. The live view continues updating at ~60 Hz during recording.
+
+Recording stops automatically when the duration is reached, or click **Stop Rec** to end early.
+
+### Trigger Modes
+
+| Mode | How it works |
 |---|---|
-| **Live Mode** | `config/live_mode.json` — full sensor 4096×2304, 10 ms exposure, no frame bundle. Use for alignment, focusing, and sample positioning. |
-| **Record Mode** | `config/record_mode.json` — 4096×256 ROI centred vertically, 1000 fps target, frame bundle 4. Exposure is auto-calculated from the camera's readout time when clicked. |
+| **Internal** | Recording starts immediately when you click Record. |
+| **External start trigger** | Camera waits for a TTL pulse, then free-runs until stopped. Choose rising or falling edge polarity. |
 
-Both buttons are blocked while capture is running. The **Save Settings** button writes the current panel values back to whichever preset was last loaded.
+### Burst Mode
+
+With external trigger selected, enable **Burst** to auto re-arm after each recording completes. Recordings are saved as numbered files in a session subfolder. The burst counter shows how many recordings have been saved. Click **Stop Burst** to end the sequence.
 
 ---
 
-### Exposure / FPS
+## Output Format
 
-| Control | Meaning |
-|---|---|
-| **Exposure (µs)** | Sensor integration time in microseconds. Directly sets `DCAM_IDPROP_EXPOSURETIME`. Active only when FPS Target is **disabled**. |
-| **FPS Target — Enable** | When checked, the Exposure field is greyed out and exposure is calculated automatically: `exposure = (1/fps) − readout_time`. |
-| **FPS Target (fps)** | Desired frames per second. The camera's actual readout time (which depends on ROI height) is queried from `DCAM_IDPROP_TIMING_READOUTTIME` and subtracted to find the maximum allowable exposure. |
-| **Readout time / Max fps** | Read-only info line updated after applying settings. Shows the current readout time and the maximum achievable fps at the current ROI. |
+Recordings are saved as **BigTIFF** files (lossless, uncompressed, >4 GB capable):
 
-**FPS → Exposure formula:**
 ```
-frame_period  = 1 / fps_target          (e.g. 1000 µs at 1000 fps)
-readout_time  = queried from camera     (e.g. 266 µs at 4096×256)
-exposure      = frame_period − readout_time  (e.g. 734 µs)
+recording_20261102_153000.tif
 ```
 
----
-
-### Image
-
-| Control | Meaning |
-|---|---|
-| **Gamma** | Hardware gamma applied by the camera sensor (`DCAM_IDPROP_GAMMA`). Range 0.10–4.00. Linear = 1.00. Zero CPU cost — done on the camera. |
-| **Auto** (gamma) | When checked, the camera manages gamma automatically. The slider is disabled. |
-| **ROI offset X / Y** | Top-left corner of the region of interest in sensor pixels. Must be a multiple of 4 (X) and 2 (Y) — the GUI enforces this automatically. |
-| **ROI size W / H** | Width and height of the ROI. Must be multiples of 4 (W) and 2 (H). Minimum 4×2. |
-| **Center V** | Helper button: sets Y offset so the ROI is vertically centred on the sensor. |
-| **Binning** | Pixel binning: 1×1, 2×2, or 4×4. After binning, the effective sensor is 2048×1152 (2×2) or 1024×576 (4×4), and all ROI coordinates are in *binned* pixels. **Always set before changing ROI.** |
-| **Frame Bundle** | Number of frames the camera groups per DMA transfer (`DCAM_IDPROP_FRAMEBUNDLE_NUMBER`). Set to ≥2 for 1000+ fps to improve transfer throughput. Record Mode uses 4. Disable (set to 1) for live preview. |
-
-**ROI and fps:**
-- Full sensor (2304 lines): 120 fps max via CoaXPress
-- 512 lines: ~540 fps
-- 256 lines: ~1080 fps (standard scan)
-- 256 lines + frame bundle: up to 19,000+ fps (ultra-high speed mode)
-
----
-
-### Recording
-
-| Control | Meaning |
-|---|---|
-| **Save path** | Folder where recordings are written. Click **…** to browse. Created automatically if it does not exist. |
-| **Frames** | Total number of frames to capture in one recording. Recording stops automatically when this count is reached. |
-| **RAM buffer** | Size of the in-memory ring buffer (frames). At 4096×256 uint16, each frame is 2 MB — 2000 frames = ~4 GB RAM. Reduce if you have less available memory. The buffer absorbs short write-speed dips without dropping frames. |
-| **Progress** | Appears during recording — shows frames written / total. |
-
-**Output files** (written to Save path, timestamped):
-```
-recording_20260701_153000.raw          # uint16 pixels, shape (N, H, W)
-recording_20260701_153000.timestamps   # float64 (N,) — wall-clock seconds per frame
-recording_20260701_153000.framestamps  # int32 (N,) — hardware monotonic counter per frame
-recording_20260701_153000.meta.json    # shape, ROI, fps, binning, date, load example
-```
-
-All files are **lossless** — identical to the raw sensor readout, no compression.
-
-**Loading in Python:**
-```python
-import numpy as np, json
-
-meta   = json.load(open("recording_20260701_153000.meta.json"))
-N, H, W = meta["shape"]
-
-frames     = np.fromfile("recording_20260701_153000.raw",        dtype=np.uint16).reshape(N, H, W)
-timestamps = np.fromfile("recording_20260701_153000.timestamps", dtype=np.float64)
-framestamps= np.fromfile("recording_20260701_153000.framestamps",dtype=np.int32)
-```
-
-**Loading in MATLAB:**
-```matlab
-meta   = jsondecode(fileread('recording_20260701_153000.meta.json'));
-frames = reshape(fread(fopen('recording_20260701_153000.raw'), '*uint16'), ...
-                 meta.shape(3), meta.shape(2), meta.shape(1));
-frames = permute(frames, [3 2 1]);   % → (N, H, W)
-```
-
----
-
-### Advanced
-
-| Control | Meaning |
-|---|---|
-| **Readout** | Sensor readout speed: *Fastest* uses the maximum pixel clock; *Standard* is slower with lower noise. For high-speed recording always use Fastest. |
-| **Trigger delay (s)** | Delay between the internal trigger signal and the start of exposure (`DCAM_IDPROP_TRIGGER_DELAY`). Set to 0 for normal operation. |
-
----
-
-### Control Buttons
-
-| Button | Action |
-|---|---|
-| **▶ Start Live** | Applies current settings to camera, starts free-running acquisition, displays frames at ~60 Hz. Settings are locked while running. |
-| **■ Stop Live** | Stops acquisition. Settings become editable again. |
-| **⏺ Record** | Applies settings, starts acquisition **and** writer thread simultaneously. Frames are written to disk. Live view continues at 60 Hz. Stops automatically when the frame count is reached. |
-| **■ Stop Rec** | Stops recording early. Frames already written to disk are kept. |
-| **💾 Save Settings** | Writes all current panel values to the last-loaded preset file (`live_mode.json` or `record_mode.json`). |
-
----
-
-### Status Bar
-
-| Indicator | Meaning |
-|---|---|
-| **● IDLE / LIVE / RECORDING** | Current camera state (green = live, red = recording) |
-| **FPS** | Rolling-window measured frame rate (120-frame window) |
-| **TS** | Hardware wall-clock timestamp of the most recently displayed frame |
-| **Dropped** | Frames dropped inside the DCAM DMA ring buffer since capture started. Any value > 0 means the ring buffer or disk cannot keep up. |
-
----
-
-## Timestamps Explained
-
-Every frame carries two independent time references, both filled automatically by the DCAM driver — no configuration required:
-
-| Field | Source | Resolution | Use |
-|---|---|---|---|
-| `timestamp` | Camera hardware clock → wall time | 1 µs | Absolute frame times, inter-frame intervals |
-| `framestamp` | Monotonic hardware counter | 1 frame | Detect dropped frames (gaps in sequence) |
-
----
-
-## Config Files
-
-`config/live_mode.json` and `config/record_mode.json` are plain JSON — edit them in any text editor to change the defaults loaded by the preset buttons.
+Each TIFF page contains one sub-frame as uint16 pixels. Page 0's `ImageDescription` tag holds full session metadata as JSON:
 
 ```json
 {
-  "fps_target": 1000.0,      // null = use exposure_us directly; number = auto-calculate exposure
-  "exposure_us": 734.0,      // µs; overridden by fps_target on load if fps_target is not null
-  "gamma": 1.0,              // 0.1 – 4.0; ignored if auto_gamma is true
-  "auto_gamma": false,
-  "roi_x": 0,                // pixels, multiple of 4
-  "roi_y": 1024,             // pixels, multiple of 2
-  "roi_width": 4096,         // pixels, multiple of 4
-  "roi_height": 256,         // pixels, multiple of 2
-  "binning": 1,              // 1, 2, or 4
-  "frame_bundle": 4,         // 1 = off; ≥2 for high-speed
-  "save_path": "C:/data",
-  "num_frames": 10000,
-  "ram_buffer_frames": 2000, // ring buffer size (reduce if RAM limited)
-  "trigger_delay": 0.0,      // seconds
-  "readout_speed": 1         // 1 = fastest, 2 = standard
+  "requested": {
+    "roi": {"x": 0, "y": 1024, "width": 4096, "height": 256},
+    "exposure_us": 734.0,
+    "binning": 4,
+    "frame_bundle": 4,
+    "trigger_source": 1,
+    "trigger_mode": 1,
+    "trigger_delay": 0.0
+  },
+  "actual": {
+    "fps": 1080.0,
+    "exposure_us": 734.0,
+    "readout_us": 266.0,
+    "binning": 4,
+    "frame_bundle": 4,
+    "image_height": 64,
+    "image_width": 1024
+  },
+  "date": "2026-11-02T15:30:00.123456",
+  "dtype": "uint16"
 }
 ```
+
+Every page also carries per-frame `timestamp`, `frame_index`, and `frame_number` in its `ImageDescription`.
+
+### Loading in Python
+
+```python
+import tifffile
+import json
+
+tif = tifffile.TiffFile("recording_20261102_153000.tif")
+
+# Session metadata from page 0
+meta = json.loads(tif.pages[0].description)
+print(meta["actual"]["fps"])
+
+# Read a specific frame
+frame = tif.pages[42].asarray()   # uint16, shape (H, W)
+
+# Read all frames at once (if they fit in RAM)
+stack = tif.asarray()  # shape (N, H, W)
+```
+
+---
+
+## Recording Viewer
+
+A standalone viewer application for playing back BigTIFF recordings:
+
+```bash
+python viewer.py                         # open GUI, then load a file
+python viewer.py recording_20261102.tif  # open a file directly
+```
+
+![Recording Viewer — playback with test data](screenshots/04_viewer.png)
+
+### Playback Controls
+
+- **Open .tif file** / **Open folder** — load a single recording or browse a folder of recordings
+- **Prev/Next File** — step through files in a folder
+- **Play/Pause** — play back at the recording's native frame rate
+- **Speed** — from 0.001x to 50x playback speed
+- **Frame slider** — scrub to any frame
+- **Arrow buttons** — step one frame forward/back
+
+### Display
+
+- **Gamma** — display gamma correction
+- **Auto** — auto-contrast (1st-99th percentile of the current frame)
+- **Reset Zoom** — fit image to window (scroll to zoom, right-drag to pan)
+
+### Measurement Tool
+
+Click **Measure**, then click two points on the image. The distance is shown in micrometers based on the **Res (um/px)** pixel size setting.
+
+### Region Activity Plot
+
+Click **Select Region**, then drag a rectangle on the image. The viewer reads every frame's ROI and plots mean intensity vs. time. Use **Save Plot** to export as PNG/SVG/PDF.
+
+### Mean Image
+
+When a folder is open, click **Generate Mean Image** to compute the average of frame 0 across all recordings. Useful for background estimation.
+
+---
+
+## Presets and Config Files
+
+Presets are plain JSON files in the `config/` folder:
+
+| File | Purpose |
+|---|---|
+| `default_live_mode.json` | Full sensor, high exposure, no frame bundle |
+| `default_record_mode.json` | 256-row ROI centered, 4x4 binning, frame bundle 4 |
+
+These default presets cannot be overwritten from the GUI. Use **Save Settings** to create your own preset files with a custom name.
+
+The **...** buttons next to Live Mode / Record Mode let you load any JSON preset file.
+
+### Config Fields
+
+```json
+{
+  "exposure_us": 734.0,
+  "roi_x": 0,
+  "roi_y": 1024,
+  "roi_width": 4096,
+  "roi_height": 256,
+  "binning": 4,
+  "frame_bundle": 4,
+  "save_path": "C:/data",
+  "file_prefix": "",
+  "trigger_source": 1,
+  "trigger_mode": 1,
+  "trigger_polarity": 2,
+  "trigger_delay": 0.0,
+  "record_duration_ms": 10000,
+  "burst_mode": false
+}
+```
+
+| Field | Values |
+|---|---|
+| `exposure_us` | Sensor integration time in microseconds |
+| `roi_x`, `roi_y` | Top-left corner in sensor pixels (multiples of 4) |
+| `roi_width`, `roi_height` | ROI dimensions in sensor pixels (multiples of 4) |
+| `binning` | 1, 2, or 4 |
+| `frame_bundle` | 1 = off, 2+ for high-speed throughput |
+| `trigger_source` | 1 = internal, 2 = external |
+| `trigger_mode` | 1 = normal (per-frame), 6 = start (sequence) |
+| `trigger_polarity` | 1 = falling edge, 2 = rising edge |
+| `trigger_delay` | Seconds; 0 for normal operation |
+| `record_duration_ms` | Recording length; 0 = manual stop |
+| `burst_mode` | Auto re-arm after each external trigger recording |
+
+---
+
+## ROI and Frame Rate
+
+Fewer sensor rows = faster readout = higher frame rate:
+
+| ROI Height | Approx. Max FPS |
+|---|---|
+| 2304 (full) | ~120 fps |
+| 512 rows | ~540 fps |
+| 256 rows | ~1080 fps |
+| 256 rows + frame bundle | 19,000+ fps |
+
+The readout info line below the exposure slider always shows the actual max FPS for your current settings.
+
+---
+
+## Status Bar
+
+| Indicator | Meaning |
+|---|---|
+| **IDLE / LIVE / RECORDING / ARMED** | Current camera state |
+| **FPS** | Measured frame rate (rolling average) |
+| **TS** | Hardware timestamp of the last displayed frame |
+| **Dropped** | Frames lost in the DMA ring buffer (should be 0) |
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---|---|---|
-| "Could not load dcamapi.dll" | DCAM-SDK4 not installed | Install from dcam-api.com |
-| "No DCAM-compatible cameras detected" | Frame grabber driver missing or cables not connected | Install frame grabber driver; check all 4 CXP cables |
-| Dropped frames > 0 during recording | Disk too slow | Use NVMe SSD; reduce ROI or fps_target |
-| Dropped frames > 0 during live view | RAM buffer too small | Increase RAM buffer in settings |
-| Actual FPS lower than target | Exposure too long, or frame bundle incompatible | Increase fps_target (reduces exposure), or verify frame_bundle is a valid divisor |
-| Black live view | Camera not started, or ROI outside sensor bounds | Click Start Live; check ROI x+w ≤ 4096, y+h ≤ 2304 |
-| App crashes on close | Thread not stopped cleanly | Known fix: always use Stop buttons before closing |
+| Symptom | Fix |
+|---|---|
+| "Could not load dcamapi.dll" | Install DCAM-SDK4 |
+| "No DCAM-compatible cameras detected" | Install frame grabber driver; check all 4 CXP cables |
+| Dropped frames during recording | Use NVMe SSD; reduce ROI or duration |
+| Actual FPS lower than expected | Decrease exposure; check frame bundle is valid |
+| Black live view | Check ROI is within sensor bounds (X+W <= 4096, Y+H <= 2304) |
+| Debug camera on startup | No hardware detected; verify camera in HoKaWo first |
 
 ---
 
@@ -300,26 +291,30 @@ Every frame carries two independent time references, both filled automatically b
 
 ```
 OrcaView/
-├── main.py                      # Entry point: python main.py
-├── requirements.txt             # PyQt6, numpy
+├── main.py                      # Entry point
+├── viewer.py                    # Standalone recording viewer
+├── requirements.txt
 ├── config/
-│   ├── live_mode.json           # Preset: full sensor, high exposure
-│   └── record_mode.json         # Preset: 256-row ROI, 1000 fps
+│   ├── default_live_mode.json   # Live preset (protected)
+│   └── default_record_mode.json # Record preset (protected)
 ├── dcam/
 │   ├── dcam_types.py            # ctypes structs and DCAM constants
 │   ├── dcam_api.py              # dcamapi.dll loader
-│   └── camera.py                # DCAMCamera class
+│   ├── camera.py                # DCAMCamera hardware driver
+│   └── debug_camera.py          # Simulated camera for testing without hardware
 ├── core/
 │   ├── settings.py              # CameraSettings dataclass + JSON I/O
 │   ├── fps_calculator.py        # Rolling FPS measurement
 │   ├── ring_buffer.py           # Pre-allocated numpy ring buffer
-│   ├── acquisition_thread.py    # QThread: camera → ring buffer
-│   └── writer_thread.py         # QThread: ring buffer → disk
+│   ├── acquisition_thread.py    # QThread: camera -> ring buffer
+│   └── writer_thread.py         # QThread: ring buffer -> BigTIFF
 └── gui/
-    ├── styles.py                # Dark QSS theme
+    ├── styles.py                # Dark theme
     ├── status_bar.py            # Status bar widget
     ├── roi_overlay.py           # Blue ROI rectangle overlay
-    ├── live_view.py             # Frame display widget
+    ├── roi_interaction.py       # ROI drag/resize interaction
+    ├── cell_markers.py          # Circular cell marker overlay
+    ├── live_view.py             # Frame display with zoom/pan
     ├── control_panel.py         # Left settings panel
     └── main_window.py           # Root window, thread wiring
 ```
